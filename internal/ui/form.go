@@ -96,7 +96,7 @@ func (m Model) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.formInputs[formFieldPassword].SetValue(generated)
 			m.formInputs[formFieldPassword].CursorEnd()
-			m.statusMsg = "🎲 Generated cryptographically secure password (20 chars)"
+			m.statusMsg = "Generated cryptographically secure password (20 chars)"
 			m.statusIsErr = false
 			return m, nil
 
@@ -169,7 +169,7 @@ func (m Model) submitForm() (tea.Model, tea.Cmd) {
 		m.clearFormInputs()
 		m.refreshListItems(updated.Id)
 		m.openDetail(updated)
-		m.statusMsg = fmt.Sprintf("✅ Entry \"%s\" updated and saved atomically", updated.Title)
+		m.statusMsg = fmt.Sprintf("Entry \"%s\" updated and saved atomically", updated.Title)
 		m.statusIsErr = false
 		return m, nil
 	}
@@ -182,7 +182,7 @@ func (m Model) submitForm() (tea.Model, tea.Cmd) {
 	m.clearFormInputs()
 	m.refreshListItems(created.Id)
 	m.openDetail(created)
-	m.statusMsg = fmt.Sprintf("✨ Entry \"%s\" created and encrypted", created.Title)
+	m.statusMsg = fmt.Sprintf("Entry \"%s\" created and encrypted", created.Title)
 	m.statusIsErr = false
 	return m, nil
 }
@@ -201,9 +201,11 @@ func (m Model) viewForm() string {
 	var b strings.Builder
 
 	if m.isEditing {
-		b.WriteString(HeaderBadgeStyle.Render("✏️ EDIT ENTRY") + "\n\n")
+		b.WriteString(HeaderBadgeStyle.Render("Edit entry"))
+		b.WriteString("\n\n")
 	} else {
-		b.WriteString(HeaderBadgeStyle.Render("➕ NEW ENTRY") + "\n\n")
+		b.WriteString(HeaderBadgeStyle.Render("New entry"))
+		b.WriteString("\n\n")
 	}
 
 	labels := []string{
@@ -219,15 +221,19 @@ func (m Model) viewForm() string {
 		if m.formFocusIdx == i {
 			lbl = FocusedLabelStyle.Render("▸ " + labels[i])
 		}
-		b.WriteString(lbl + " " + m.formInputs[i].View())
+		b.WriteString(lbl)
+		b.WriteString(" ")
+		b.WriteString(m.formInputs[i].View())
 		if i == formFieldPassword {
-			b.WriteString("  " + MutedStyle.Render("[Ctrl+G: generate | Ctrl+R: reveal]"))
+			b.WriteString("  ")
+			b.WriteString(MutedStyle.Render("[Ctrl+G: generate | Ctrl+R: reveal]"))
 		}
 		b.WriteString("\n\n")
 	}
 
 	if m.formErr != "" {
-		b.WriteString(ErrorStyle.Render("⚠️ "+m.formErr) + "\n")
+		b.WriteString(ErrorStyle.Render(m.formErr))
+		b.WriteString("\n")
 	}
 
 	card := CardStyle.Width(min(92, max(64, m.width-8))).Render(b.String())

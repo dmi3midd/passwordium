@@ -117,7 +117,7 @@ func (m Model) submitAuth() (tea.Model, tea.Cmd) {
 	if err != nil {
 		m.authInputs[0].SetValue("")
 		if errors.Is(err, vault.ErrInvalidMasterPassword) {
-			m.authErr = "❌ Invalid master password (Poly1305 authentication failed)"
+			m.authErr = "Invalid master password"
 		} else {
 			m.authErr = fmt.Sprintf("Failed to open vault: %v", err)
 		}
@@ -144,34 +144,50 @@ func (m *Model) clearAuthInputs() {
 func (m Model) viewAuth() string {
 	var b strings.Builder
 
-	header := HeaderBadgeStyle.Render("🔐 PASSWORDIUM")
-	b.WriteString(header + "\n\n")
+	header := HeaderBadgeStyle.Render("Passwordium")
+	b.WriteString(header)
+	b.WriteString("\n\n")
 
 	if m.isNewVault {
-		b.WriteString(ValueStyle.Bold(true).Render("Initialize New Vault") + "\n")
-		b.WriteString(SubHeaderStyle.Render(fmt.Sprintf("File %s not found. Create a master password (Argon2id + XChaCha20-Poly1305).", m.vaultPath)) + "\n\n")
+		b.WriteString(ValueStyle.Bold(true).Render("Initialize New Vault"))
+		b.WriteString("\n")
+		b.WriteString(SubHeaderStyle.Render(fmt.Sprintf("File %s not found. Create a master password.", m.vaultPath)))
+		b.WriteString("\n\n")
 
 		lbl1 := LabelStyle.Render("Master Password:")
 		if m.authFocusIdx == 0 {
 			lbl1 = FocusedLabelStyle.Render("▸ Master Password:")
 		}
-		b.WriteString(lbl1 + " " + m.authInputs[0].View() + "\n\n")
+		b.WriteString(lbl1)
+		b.WriteString(" ")
+		b.WriteString(m.authInputs[0].View())
+		b.WriteString("\n\n")
 
 		lbl2 := LabelStyle.Render("Confirm Password:")
 		if m.authFocusIdx == 1 {
 			lbl2 = FocusedLabelStyle.Render("▸ Confirm Password:")
 		}
-		b.WriteString(lbl2 + " " + m.authInputs[1].View() + "\n")
+		b.WriteString(lbl2)
+		b.WriteString(" ")
+		b.WriteString(m.authInputs[1].View())
+		b.WriteString("\n")
 	} else {
-		b.WriteString(ValueStyle.Bold(true).Render("Unlock Vault") + "\n")
-		b.WriteString(SubHeaderStyle.Render(fmt.Sprintf("Vault: %s", m.vaultPath)) + "\n\n")
+		b.WriteString(ValueStyle.Bold(true).Render("Unlock Vault"))
+		b.WriteString("\n")
+		b.WriteString(SubHeaderStyle.Render(fmt.Sprintf("Vault: %s", m.vaultPath)))
+		b.WriteString("\n\n")
 
 		lbl := FocusedLabelStyle.Render("▸ Master Password:")
-		b.WriteString(lbl + " " + m.authInputs[0].View() + "\n")
+		b.WriteString(lbl)
+		b.WriteString(" ")
+		b.WriteString(m.authInputs[0].View())
+		b.WriteString("\n")
 	}
 
 	if m.authErr != "" {
-		b.WriteString("\n" + ErrorStyle.Render(m.authErr) + "\n")
+		b.WriteString("\n")
+		b.WriteString(ErrorStyle.Render(m.authErr))
+		b.WriteString("\n")
 	}
 
 	hints := []string{

@@ -38,7 +38,7 @@ func (m Model) copyEntryPassword(entry *pb.VaultEntry) (tea.Model, tea.Cmd) {
 	m.clipboardSeq++
 	seq := m.clipboardSeq
 	m.clipboardCountdown = int(clipboardClearDuration.Seconds())
-	m.statusMsg = fmt.Sprintf("📋 Password for \"%s\" copied to clipboard", entry.Title)
+	m.statusMsg = fmt.Sprintf("Password for \"%s\" copied to clipboard", entry.Title)
 	m.statusIsErr = false
 
 	clearCmd := tea.Tick(clipboardClearDuration, func(t time.Time) tea.Msg {
@@ -62,7 +62,7 @@ func (m Model) renderStatusFooter(hints string) string {
 			statusLine = SuccessStyle.Render(m.statusMsg)
 		}
 		if m.clipboardCountdown > 0 {
-			timerBadge := NoticeStyle.Render(fmt.Sprintf("⏱ Auto-clearing clipboard in %ds", m.clipboardCountdown))
+			timerBadge := NoticeStyle.Render(fmt.Sprintf("Auto-clearing clipboard in %ds", m.clipboardCountdown))
 			if statusLine != "" {
 				statusLine = statusLine + "   •   " + timerBadge
 			} else {

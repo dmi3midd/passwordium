@@ -22,7 +22,21 @@ const (
 	SaltSize                     = 32
 	FileEncryptionContext        = "vault-file-encryption-v1"
 	EntryEncryptionCtx           = "vault-entry-encryption-v1"
+	AppDirName                   = "passwordium"
+	VaultFileName                = "vault.enc"
 )
+
+// SystemVaultPath returns the fixed OS-specific application data path for the vault file:
+//   - macOS:   ~/Library/Application Support/passwordium/vault.enc
+//   - Linux:   ~/.config/passwordium/vault.enc (or $XDG_CONFIG_HOME/passwordium/vault.enc)
+//   - Windows: %AppData%\passwordium\vault.enc
+func SystemVaultPath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve system application directory: %w", err)
+	}
+	return filepath.Join(configDir, AppDirName, VaultFileName), nil
+}
 
 var (
 	ErrInvalidMasterPassword = errors.New("invalid master password or corrupted vault file (Poly1305 authentication failed)")

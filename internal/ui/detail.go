@@ -46,7 +46,7 @@ func (m Model) updateDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.passwordRevealed {
 				m.passwordRevealed = false
 				m.revealedPassword = ""
-				m.statusMsg = "🙈 Password hidden"
+				m.statusMsg = "Password encrypted"
 				m.statusIsErr = false
 				return m, nil
 			}
@@ -58,7 +58,7 @@ func (m Model) updateDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.revealedPassword = pw
 			m.passwordRevealed = true
-			m.statusMsg = "👁️ Password temporarily decrypted via entryKey"
+			m.statusMsg = "Password temporarily decrypted"
 			m.statusIsErr = false
 			return m, nil
 
@@ -83,7 +83,7 @@ func (m Model) updateDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.refreshListItems("")
 			m.state = StateList
-			m.statusMsg = fmt.Sprintf("🗑️ Entry \"%s\" deleted", title)
+			m.statusMsg = fmt.Sprintf("Entry \"%s\" deleted", title)
 			m.statusIsErr = false
 			return m, nil
 		}
@@ -99,21 +99,39 @@ func (m Model) viewDetail() string {
 	e := m.selectedEntry
 
 	var b strings.Builder
-	b.WriteString(HeaderBadgeStyle.Render("📄 ENTRY DETAILS") + "  " + MutedStyle.Render("ID: "+e.Id) + "\n\n")
+	b.WriteString(HeaderBadgeStyle.Render("Entry details"))
+	b.WriteString("  ")
+	b.WriteString(MutedStyle.Render("ID: " + e.Id))
+	b.WriteString("\n\n")
 
-	b.WriteString(LabelStyle.Render("Title:") + " " + ValueStyle.Bold(true).Render(nonEmpty(e.Title, "—")) + "\n")
-	b.WriteString(LabelStyle.Render("Username:") + " " + ValueStyle.Render(nonEmpty(e.Username, "—")) + "\n")
+	b.WriteString(LabelStyle.Render("Title:"))
+	b.WriteString(" ")
+	b.WriteString(ValueStyle.Bold(true).Render(nonEmpty(e.Title, "—")))
+	b.WriteString("\n")
+	b.WriteString(LabelStyle.Render("Username:"))
+	b.WriteString(" ")
+	b.WriteString(ValueStyle.Render(nonEmpty(e.Username, "—")))
+	b.WriteString("\n")
 
 	var pwRender string
 	if m.passwordRevealed {
-		pwRender = RevealedPasswordStyle.Render(m.revealedPassword) + " " + MutedStyle.Render("(decrypted via entryKey)")
+		pwRender = RevealedPasswordStyle.Render(m.revealedPassword)
 	} else {
-		pwRender = MaskedPasswordStyle.Render("••••••••••••") + " " + MutedStyle.Render("(encrypted in RAM, press 'v' to reveal)")
+		pwRender = MaskedPasswordStyle.Render("••••••••••••")
 	}
-	b.WriteString(LabelStyle.Render("Password:") + " " + pwRender + "\n")
+	b.WriteString(LabelStyle.Render("Password:"))
+	b.WriteString(" ")
+	b.WriteString(pwRender)
+	b.WriteString("\n")
 
-	b.WriteString(LabelStyle.Render("URL:") + " " + ValueStyle.Render(nonEmpty(e.Url, "—")) + "\n")
-	b.WriteString(LabelStyle.Render("Notes:") + " " + ValueStyle.Render(nonEmpty(m.decryptedNotes, "—")) + "\n\n")
+	b.WriteString(LabelStyle.Render("URL:"))
+	b.WriteString(" ")
+	b.WriteString(ValueStyle.Render(nonEmpty(e.Url, "—")))
+	b.WriteString("\n")
+	b.WriteString(LabelStyle.Render("Notes:"))
+	b.WriteString(" ")
+	b.WriteString(ValueStyle.Render(nonEmpty(m.decryptedNotes, "—")))
+	b.WriteString("\n\n")
 
 	createdStr := formatUnixTime(e.CreatedAt)
 	updatedStr := formatUnixTime(e.UpdatedAt)

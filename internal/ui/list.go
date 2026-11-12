@@ -118,7 +118,7 @@ func (m Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.refreshListItems("")
-			m.statusMsg = fmt.Sprintf("🗑️ Entry \"%s\" deleted", title)
+			m.statusMsg = fmt.Sprintf("Entry \"%s\" deleted", title)
 			m.statusIsErr = false
 			return m, nil
 		}

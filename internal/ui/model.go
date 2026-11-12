@@ -104,7 +104,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.seq == m.clipboardSeq {
 			_ = clipboard.Clear(msg.secret)
 			m.clipboardCountdown = 0
-			m.statusMsg = "🧹 Clipboard automatically cleared (15s elapsed)"
+			m.statusMsg = "Clipboard automatically cleared (15s elapsed)"
 			m.statusIsErr = false
 		}
 		return m, nil
