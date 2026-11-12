@@ -7,14 +7,14 @@ import (
 )
 
 // entryItem wraps pb.VaultEntry to implement bubbles/list.DefaultItem.
-// Note that sensitive fields inside entry remain encrypted while in the list.
+// Sensitive fields inside entry remain encrypted while in the list.
 type entryItem struct {
 	entry *pb.VaultEntry
 }
 
 func (i entryItem) Title() string {
 	if i.entry.Title == "" {
-		return "(Без назви)"
+		return "(Untitled)"
 	}
 	return i.entry.Title
 }
@@ -34,4 +34,3 @@ func (i entryItem) Description() string {
 func (i entryItem) FilterValue() string {
 	return i.entry.Title + " " + i.entry.Username
 }
-

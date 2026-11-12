@@ -85,4 +85,3 @@ func TestUIStateMachineFlow(t *testing.T) {
 		m.vault.Close()
 	}
 }
-

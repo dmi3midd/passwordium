@@ -21,4 +21,3 @@ func Clear(expected string) error {
 	}
 	return clipboard.WriteAll("")
 }
-

@@ -15,12 +15,12 @@ func main() {
 		defaultPath = "vault.enc"
 	}
 
-	vaultPath := flag.String("vault", defaultPath, "Шлях до зашифрованого файлу сховища (Protobuf)")
+	vaultPath := flag.String("vault", defaultPath, "Path to the encrypted vault file (Protobuf)")
 	flag.Parse()
 
 	p := tea.NewProgram(ui.NewModel(*vaultPath), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Помилка роботи TUI: %v\n", err)
+		fmt.Fprintf(os.Stderr, "TUI runtime error: %v\n", err)
 		os.Exit(1)
 	}
 }

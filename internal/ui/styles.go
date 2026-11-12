@@ -1,6 +1,11 @@
 package ui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/lipgloss"
+)
 
 var (
 	colorPrimary   = lipgloss.AdaptiveColor{Light: "#5A32EA", Dark: "#8B5CF6"}
@@ -9,8 +14,8 @@ var (
 	colorDanger    = lipgloss.AdaptiveColor{Light: "#DC2626", Dark: "#F87171"}
 	colorSuccess   = lipgloss.AdaptiveColor{Light: "#16A34A", Dark: "#4ADE80"}
 	colorMuted     = lipgloss.AdaptiveColor{Light: "#6B7280", Dark: "#9CA3AF"}
-	colorSurface   = lipgloss.AdaptiveColor{Light: "#F3F4F6", Dark: "#1F2937"}
-	colorText      = lipgloss.AdaptiveColor{Light: "#111827", Dark: "#F9FAFB"}
+	// colorSurface   = lipgloss.AdaptiveColor{Light: "#F3F4F6", Dark: "#1F2937"}
+	colorText = lipgloss.AdaptiveColor{Light: "#111827", Dark: "#F9FAFB"}
 
 	AppContainerStyle = lipgloss.NewStyle().
 				Padding(1, 2)
@@ -33,12 +38,12 @@ var (
 	LabelStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(colorSecondary).
-			Width(16)
+			Width(18)
 
 	FocusedLabelStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(colorPrimary).
-				Width(16)
+				Width(18)
 
 	ValueStyle = lipgloss.NewStyle().
 			Foreground(colorText)
@@ -84,3 +89,16 @@ func renderKeyHint(key, desc string) string {
 	return KeyHelpStyle.Render(key) + " " + DescHelpStyle.Render(desc)
 }
 
+func nonEmpty(s, fallback string) string {
+	if strings.TrimSpace(s) == "" {
+		return fallback
+	}
+	return s
+}
+
+func formatUnixTime(ts int64) string {
+	if ts <= 0 {
+		return "—"
+	}
+	return time.Unix(ts, 0).Local().Format("2006-01-02 15:04:05")
+}

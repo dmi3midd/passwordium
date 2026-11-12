@@ -133,4 +133,3 @@ func TestOuterAADTamperingDetection(t *testing.T) {
 		t.Fatalf("expected ErrInvalidMasterPassword when outer version AAD is tampered, got %v", err)
 	}
 }
-

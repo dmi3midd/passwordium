@@ -25,9 +25,9 @@ const (
 )
 
 var (
-	ErrInvalidMasterPassword = errors.New("невірний майстер-пароль або пошкоджений файл сховища (помилка автентифікації Poly1305)")
-	ErrEntryNotFound         = errors.New("запис не знайдено")
-	ErrCorruptedVaultFile    = errors.New("файл сховища пошкоджений або має невірний формат")
+	ErrInvalidMasterPassword = errors.New("invalid master password or corrupted vault file (Poly1305 authentication failed)")
+	ErrEntryNotFound         = errors.New("entry not found")
+	ErrCorruptedVaultFile    = errors.New("vault file is corrupted or has an invalid format")
 )
 
 // Vault manages the in-memory state of the password store.
@@ -97,10 +97,10 @@ func Open(path string, masterPassword []byte) (*Vault, error) {
 	}
 
 	if len(encFile.Salt) != 16 && len(encFile.Salt) != 32 {
-		return nil, fmt.Errorf("%w: невірний розмір солі (%d байтів)", ErrCorruptedVaultFile, len(encFile.Salt))
+		return nil, fmt.Errorf("%w: invalid salt size (%d bytes)", ErrCorruptedVaultFile, len(encFile.Salt))
 	}
 	if len(encFile.FileNonce) != 24 {
-		return nil, fmt.Errorf("%w: невірний розмір file_nonce (%d байтів)", ErrCorruptedVaultFile, len(encFile.FileNonce))
+		return nil, fmt.Errorf("%w: invalid file_nonce size (%d bytes)", ErrCorruptedVaultFile, len(encFile.FileNonce))
 	}
 
 	fileKey, entryKey, err := deriveSubKeys(masterPassword, encFile.Salt)
@@ -435,4 +435,3 @@ func (v *Vault) DecryptNotes(entry *pb.VaultEntry) (string, error) {
 	defer ZeroBytes(plain)
 	return string(plain), nil
 }
-
