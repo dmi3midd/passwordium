@@ -41,31 +41,21 @@ func (m Model) updateAuth(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			return m, tea.Quit
 
-		case "tab", "shift+tab", "up", "down":
+		case "tab":
 			if !m.isNewVault {
 				return m, nil
 			}
-			if msg.String() == "tab" || msg.String() == "down" {
-				m.authFocusIdx = (m.authFocusIdx + 1) % len(m.authInputs)
-			} else {
-				m.authFocusIdx = (m.authFocusIdx - 1 + len(m.authInputs)) % len(m.authInputs)
+			m.authFocusIdx = (m.authFocusIdx + 1) % len(m.authInputs)
+			return m, m.focusAuthInput()
+
+		case "shift+tab":
+			if !m.isNewVault {
+				return m, nil
 			}
-			cmds := make([]tea.Cmd, len(m.authInputs))
-			for i := range m.authInputs {
-				if i == m.authFocusIdx {
-					cmds[i] = m.authInputs[i].Focus()
-				} else {
-					m.authInputs[i].Blur()
-				}
-			}
-			return m, tea.Batch(cmds...)
+			m.authFocusIdx = (m.authFocusIdx - 1 + len(m.authInputs)) % len(m.authInputs)
+			return m, m.focusAuthInput()
 
 		case "enter":
-			if m.isNewVault && m.authFocusIdx == 0 {
-				m.authFocusIdx = 1
-				m.authInputs[0].Blur()
-				return m, m.authInputs[1].Focus()
-			}
 			return m.submitAuth()
 		}
 	}
@@ -75,11 +65,24 @@ func (m Model) updateAuth(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m *Model) focusAuthInput() tea.Cmd {
+	cmds := make([]tea.Cmd, len(m.authInputs))
+	for i := range m.authInputs {
+		if i == m.authFocusIdx {
+			cmds[i] = m.authInputs[i].Focus()
+		} else {
+			m.authInputs[i].Blur()
+		}
+	}
+	return tea.Batch(cmds...)
+}
+
 func (m Model) submitAuth() (tea.Model, tea.Cmd) {
 	pw := m.authInputs[0].Value()
 	if len(pw) == 0 {
 		m.authErr = "Master password cannot be empty"
-		return m, nil
+		m.authFocusIdx = 0
+		return m, m.focusAuthInput()
 	}
 
 	if m.isNewVault {
@@ -87,7 +90,8 @@ func (m Model) submitAuth() (tea.Model, tea.Cmd) {
 		if pw != confirm {
 			m.authErr = "Passwords do not match. Please try again"
 			m.authInputs[1].SetValue("")
-			return m, nil
+			m.authFocusIdx = 1
+			return m, m.focusAuthInput()
 		}
 
 		pwBytes := []byte(pw)
@@ -141,58 +145,46 @@ func (m Model) viewAuth() string {
 	var b strings.Builder
 
 	header := HeaderBadgeStyle.Render("🔐 PASSWORDIUM")
-	b.WriteString(header)
-	b.WriteString("\n\n")
+	b.WriteString(header + "\n\n")
 
 	if m.isNewVault {
-		b.WriteString(ValueStyle.Bold(true).Render("Initialize New Vault"))
-		b.WriteString("\n")
-		b.WriteString(SubHeaderStyle.Render(fmt.Sprintf("File %s not found. Create a master password (Argon2id + XChaCha20-Poly1305).", m.vaultPath)))
-		b.WriteString("\n\n")
+		b.WriteString(ValueStyle.Bold(true).Render("Initialize New Vault") + "\n")
+		b.WriteString(SubHeaderStyle.Render(fmt.Sprintf("File %s not found. Create a master password (Argon2id + XChaCha20-Poly1305).", m.vaultPath)) + "\n\n")
 
 		lbl1 := LabelStyle.Render("Master Password:")
 		if m.authFocusIdx == 0 {
 			lbl1 = FocusedLabelStyle.Render("▸ Master Password:")
 		}
-		b.WriteString(lbl1)
-		b.WriteString(" ")
-		b.WriteString(m.authInputs[0].View())
-		b.WriteString("\n\n")
+		b.WriteString(lbl1 + " " + m.authInputs[0].View() + "\n\n")
 
 		lbl2 := LabelStyle.Render("Confirm Password:")
 		if m.authFocusIdx == 1 {
 			lbl2 = FocusedLabelStyle.Render("▸ Confirm Password:")
 		}
-		b.WriteString(lbl2)
-		b.WriteString(" ")
-		b.WriteString(m.authInputs[1].View())
-		b.WriteString("\n")
+		b.WriteString(lbl2 + " " + m.authInputs[1].View() + "\n")
 	} else {
-		b.WriteString(ValueStyle.Bold(true).Render("Unlock Vault"))
-		b.WriteString("\n")
-		b.WriteString(SubHeaderStyle.Render(fmt.Sprintf("Vault: %s", m.vaultPath)))
-		b.WriteString("\n\n")
+		b.WriteString(ValueStyle.Bold(true).Render("Unlock Vault") + "\n")
+		b.WriteString(SubHeaderStyle.Render(fmt.Sprintf("Vault: %s", m.vaultPath)) + "\n\n")
 
 		lbl := FocusedLabelStyle.Render("▸ Master Password:")
-		b.WriteString(lbl)
-		b.WriteString(" ")
-		b.WriteString(m.authInputs[0].View())
-		b.WriteString("\n")
+		b.WriteString(lbl + " " + m.authInputs[0].View() + "\n")
 	}
 
 	if m.authErr != "" {
-		b.WriteString("\n")
-		b.WriteString(ErrorStyle.Render(m.authErr))
-		b.WriteString("\n")
+		b.WriteString("\n" + ErrorStyle.Render(m.authErr) + "\n")
 	}
 
 	hints := []string{
-		renderKeyHint("enter", "continue"),
+		renderKeyHint("enter", "unlock"),
 	}
 	if m.isNewVault {
-		hints = append(hints, renderKeyHint("tab", "switch field"))
+		hints = []string{
+			renderKeyHint("tab", "next field"),
+			renderKeyHint("shift+tab", "prev field"),
+			renderKeyHint("enter", "create vault"),
+		}
 	}
-	hints = append(hints, renderKeyHint("esc/ctrl+c", "quit"))
+	hints = append(hints, renderKeyHint("esc", "quit"))
 
 	card := CardStyle.Width(min(74, max(54, m.width-8))).Render(b.String())
 	return lipgloss.JoinVertical(lipgloss.Left, card, StatusBarStyle.Render(strings.Join(hints, "   ")))

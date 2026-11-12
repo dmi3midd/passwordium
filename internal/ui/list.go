@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -23,6 +24,25 @@ func newEntryList() list.Model {
 	l.SetShowStatusBar(true)
 	l.SetFilteringEnabled(true)
 	l.SetShowHelp(false)
+
+	// Enforce a single canonical key per list action (no alternative keys)
+	l.KeyMap = list.KeyMap{
+		CursorUp:             key.NewBinding(key.WithKeys("up"), key.WithHelp("up", "up")),
+		CursorDown:           key.NewBinding(key.WithKeys("down"), key.WithHelp("down", "down")),
+		PrevPage:             key.NewBinding(key.WithKeys("left"), key.WithHelp("left", "prev page")),
+		NextPage:             key.NewBinding(key.WithKeys("right"), key.WithHelp("right", "next page")),
+		GoToStart:            key.NewBinding(key.WithKeys("home"), key.WithHelp("home", "start")),
+		GoToEnd:              key.NewBinding(key.WithKeys("end"), key.WithHelp("end", "end")),
+		Filter:               key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "search")),
+		ClearFilter:          key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "clear search")),
+		CancelWhileFiltering: key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "cancel")),
+		AcceptWhileFiltering: key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "apply")),
+		ShowFullHelp:         key.NewBinding(key.WithDisabled()),
+		CloseFullHelp:        key.NewBinding(key.WithDisabled()),
+		Quit:                 key.NewBinding(key.WithDisabled()),
+		ForceQuit:            key.NewBinding(key.WithDisabled()),
+	}
+
 	return l
 }
 
@@ -111,11 +131,13 @@ func (m Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) viewList() string {
 	hints := strings.Join([]string{
-		renderKeyHint("n", "new entry"),
+		renderKeyHint("up", "up"),
+		renderKeyHint("down", "down"),
+		renderKeyHint("n", "new"),
 		renderKeyHint("enter", "view"),
 		renderKeyHint("c", "copy password"),
 		renderKeyHint("d", "delete"),
-		renderKeyHint("/", "search"),
+		renderKeyHint("s", "search"),
 		renderKeyHint("q", "quit"),
 	}, "   ")
 

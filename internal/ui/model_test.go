@@ -17,12 +17,13 @@ func TestUIStateMachineFlow(t *testing.T) {
 		t.Fatalf("expected initial StateAuth with isNewVault=true, got state=%v isNewVault=%v", m.state, m.isNewVault)
 	}
 
-	// Set master password and confirmation, then press Enter to create vault
+	// Set master password, press Tab to switch to confirm field, set confirm password, then press Enter
 	m.authInputs[0].SetValue("SuperSecretMaster123!")
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
 	m.authInputs[1].SetValue("SuperSecretMaster123!")
-	m.authFocusIdx = 1
 
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(Model)
 
 	if m.state != StateList {
@@ -36,9 +37,13 @@ func TestUIStateMachineFlow(t *testing.T) {
 		t.Fatalf("expected StateForm after pressing 'n', got %v", m.state)
 	}
 
-	// Fill Title & Username, then press Ctrl+G to generate a cryptographic password
+	// Fill Title, Tab to Username, Tab to Password, then press Ctrl+G to generate a cryptographic password
 	m.formInputs[formFieldTitle].SetValue("GitLab")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
 	m.formInputs[formFieldUsername].SetValue("dev@example.com")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
 
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
 	m = updated.(Model)

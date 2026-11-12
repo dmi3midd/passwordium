@@ -42,13 +42,6 @@ func (m Model) updateDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.state = StateList
 			return m, nil
 
-		case "q":
-			m.cleanupSensitiveState()
-			if m.vault != nil {
-				m.vault.Close()
-			}
-			return m, tea.Quit
-
 		case "v":
 			if m.passwordRevealed {
 				m.passwordRevealed = false
@@ -106,19 +99,10 @@ func (m Model) viewDetail() string {
 	e := m.selectedEntry
 
 	var b strings.Builder
-	b.WriteString(HeaderBadgeStyle.Render("📄 ENTRY DETAILS"))
-	b.WriteString("  ")
-	b.WriteString(MutedStyle.Render("ID: " + e.Id))
-	b.WriteString("\n\n")
+	b.WriteString(HeaderBadgeStyle.Render("📄 ENTRY DETAILS") + "  " + MutedStyle.Render("ID: "+e.Id) + "\n\n")
 
-	b.WriteString(LabelStyle.Render("Title:"))
-	b.WriteString(" ")
-	b.WriteString(ValueStyle.Bold(true).Render(nonEmpty(e.Title, "—")))
-	b.WriteString("\n")
-	b.WriteString(LabelStyle.Render("Username:"))
-	b.WriteString(" ")
-	b.WriteString(ValueStyle.Render(nonEmpty(e.Username, "—")))
-	b.WriteString("\n")
+	b.WriteString(LabelStyle.Render("Title:") + " " + ValueStyle.Bold(true).Render(nonEmpty(e.Title, "—")) + "\n")
+	b.WriteString(LabelStyle.Render("Username:") + " " + ValueStyle.Render(nonEmpty(e.Username, "—")) + "\n")
 
 	var pwRender string
 	if m.passwordRevealed {
@@ -126,19 +110,10 @@ func (m Model) viewDetail() string {
 	} else {
 		pwRender = MaskedPasswordStyle.Render("••••••••••••") + " " + MutedStyle.Render("(encrypted in RAM, press 'v' to reveal)")
 	}
-	b.WriteString(LabelStyle.Render("Password:"))
-	b.WriteString(" ")
-	b.WriteString(pwRender)
-	b.WriteString("\n")
+	b.WriteString(LabelStyle.Render("Password:") + " " + pwRender + "\n")
 
-	b.WriteString(LabelStyle.Render("URL:"))
-	b.WriteString(" ")
-	b.WriteString(ValueStyle.Render(nonEmpty(e.Url, "—")))
-	b.WriteString("\n")
-	b.WriteString(LabelStyle.Render("Notes:"))
-	b.WriteString(" ")
-	b.WriteString(ValueStyle.Render(nonEmpty(m.decryptedNotes, "—")))
-	b.WriteString("\n\n")
+	b.WriteString(LabelStyle.Render("URL:") + " " + ValueStyle.Render(nonEmpty(e.Url, "—")) + "\n")
+	b.WriteString(LabelStyle.Render("Notes:") + " " + ValueStyle.Render(nonEmpty(m.decryptedNotes, "—")) + "\n\n")
 
 	createdStr := formatUnixTime(e.CreatedAt)
 	updatedStr := formatUnixTime(e.UpdatedAt)
@@ -151,7 +126,7 @@ func (m Model) viewDetail() string {
 		renderKeyHint("c", "copy password (15s)"),
 		renderKeyHint("e", "edit"),
 		renderKeyHint("d", "delete"),
-		renderKeyHint("esc", "back to list"),
+		renderKeyHint("esc", "back"),
 	}, "   ")
 
 	return lipgloss.JoinVertical(

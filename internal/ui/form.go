@@ -86,6 +86,9 @@ func (m Model) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "ctrl+g":
+			if m.formFocusIdx != formFieldPassword {
+				return m, nil
+			}
 			generated, err := vault.GeneratePassword(vault.DefaultGeneratedPasswordLen)
 			if err != nil {
 				m.formErr = fmt.Sprintf("Failed to generate password: %v", err)
@@ -98,6 +101,9 @@ func (m Model) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "ctrl+r":
+			if m.formFocusIdx != formFieldPassword {
+				return m, nil
+			}
 			m.formShowPass = !m.formShowPass
 			if m.formShowPass {
 				m.formInputs[formFieldPassword].EchoMode = textinput.EchoNormal
@@ -109,35 +115,31 @@ func (m Model) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+s":
 			return m.submitForm()
 
-		case "tab", "shift+tab", "down", "up":
-			if msg.String() == "tab" || msg.String() == "down" {
-				m.formFocusIdx = (m.formFocusIdx + 1) % formFieldCount
-			} else {
-				m.formFocusIdx = (m.formFocusIdx - 1 + formFieldCount) % formFieldCount
-			}
-			cmds := make([]tea.Cmd, formFieldCount)
-			for i := range formFieldCount {
-				if i == m.formFocusIdx {
-					cmds[i] = m.formInputs[i].Focus()
-				} else {
-					m.formInputs[i].Blur()
-				}
-			}
-			return m, tea.Batch(cmds...)
+		case "tab":
+			m.formFocusIdx = (m.formFocusIdx + 1) % formFieldCount
+			return m, m.focusFormInput()
 
-		case "enter":
-			if m.formFocusIdx < formFieldCount-1 {
-				m.formInputs[m.formFocusIdx].Blur()
-				m.formFocusIdx++
-				return m, m.formInputs[m.formFocusIdx].Focus()
-			}
-			return m.submitForm()
+		case "shift+tab":
+			m.formFocusIdx = (m.formFocusIdx - 1 + formFieldCount) % formFieldCount
+			return m, m.focusFormInput()
 		}
 	}
 
 	var cmd tea.Cmd
 	m.formInputs[m.formFocusIdx], cmd = m.formInputs[m.formFocusIdx].Update(msg)
 	return m, cmd
+}
+
+func (m *Model) focusFormInput() tea.Cmd {
+	cmds := make([]tea.Cmd, formFieldCount)
+	for i := range formFieldCount {
+		if i == m.formFocusIdx {
+			cmds[i] = m.formInputs[i].Focus()
+		} else {
+			m.formInputs[i].Blur()
+		}
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m Model) submitForm() (tea.Model, tea.Cmd) {
@@ -149,15 +151,13 @@ func (m Model) submitForm() (tea.Model, tea.Cmd) {
 
 	if title == "" {
 		m.formErr = "Field \"Title\" is required"
-		m.formInputs[m.formFocusIdx].Blur()
 		m.formFocusIdx = formFieldTitle
-		return m, m.formInputs[formFieldTitle].Focus()
+		return m, m.focusFormInput()
 	}
 	if password == "" {
-		m.formErr = "Field \"Password\" cannot be empty (press Ctrl+G to generate)"
-		m.formInputs[m.formFocusIdx].Blur()
+		m.formErr = "Field \"Password\" cannot be empty (press Ctrl+G on Password field to generate)"
 		m.formFocusIdx = formFieldPassword
-		return m, m.formInputs[formFieldPassword].Focus()
+		return m, m.focusFormInput()
 	}
 
 	if m.isEditing {
@@ -201,11 +201,9 @@ func (m Model) viewForm() string {
 	var b strings.Builder
 
 	if m.isEditing {
-		b.WriteString(HeaderBadgeStyle.Render("✏️ EDIT ENTRY"))
-		b.WriteString("\n\n")
+		b.WriteString(HeaderBadgeStyle.Render("✏️ EDIT ENTRY") + "\n\n")
 	} else {
-		b.WriteString(HeaderBadgeStyle.Render("➕ NEW ENTRY"))
-		b.WriteString("\n\n")
+		b.WriteString(HeaderBadgeStyle.Render("➕ NEW ENTRY") + "\n\n")
 	}
 
 	labels := []string{
@@ -221,28 +219,25 @@ func (m Model) viewForm() string {
 		if m.formFocusIdx == i {
 			lbl = FocusedLabelStyle.Render("▸ " + labels[i])
 		}
-		b.WriteString(lbl)
-		b.WriteString(" ")
-		b.WriteString(m.formInputs[i].View())
+		b.WriteString(lbl + " " + m.formInputs[i].View())
 		if i == formFieldPassword {
-			b.WriteString("  ")
-			b.WriteString(MutedStyle.Render("[Ctrl+G: generate | Ctrl+R: reveal]"))
+			b.WriteString("  " + MutedStyle.Render("[Ctrl+G: generate | Ctrl+R: reveal]"))
 		}
 		b.WriteString("\n\n")
 	}
 
 	if m.formErr != "" {
-		b.WriteString(ErrorStyle.Render("⚠️ " + m.formErr))
-		b.WriteString("\n")
+		b.WriteString(ErrorStyle.Render("⚠️ "+m.formErr) + "\n")
 	}
 
 	card := CardStyle.Width(min(92, max(64, m.width-8))).Render(b.String())
 
 	hints := strings.Join([]string{
-		renderKeyHint("tab/shift+tab", "navigate"),
+		renderKeyHint("tab", "next field"),
+		renderKeyHint("shift+tab", "prev field"),
 		renderKeyHint("ctrl+g", "generate password"),
 		renderKeyHint("ctrl+r", "reveal password"),
-		renderKeyHint("ctrl+s/enter", "save"),
+		renderKeyHint("ctrl+s", "save"),
 		renderKeyHint("esc", "cancel"),
 	}, "   ")
 
