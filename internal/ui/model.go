@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/dmi3midd/passwordium/internal/clipboard"
@@ -49,6 +50,7 @@ type Model struct {
 	isEditing      bool
 	editingEntryID string
 	formInputs     []textinput.Model
+	formNotes      textarea.Model
 	formFocusIdx   int
 	formShowPass   bool
 	formErr        string

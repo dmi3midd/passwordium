@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -21,17 +22,16 @@ const (
 )
 
 func (m *Model) initForm(entry *pb.VaultEntry) tea.Cmd {
-	inputs := make([]textinput.Model, formFieldCount)
+	inputs := make([]textinput.Model, formFieldNotes)
 
 	placeholders := []string{
 		"e.g., GitHub, Gmail, AWS...",
 		"username or email@example.com",
 		"Press Ctrl+G to generate a strong password",
 		"https://...",
-		"Additional notes, recovery codes, PIN...",
 	}
 
-	for i := range formFieldCount {
+	for i := range formFieldNotes {
 		ti := textinput.New()
 		ti.Placeholder = placeholders[i]
 		ti.CharLimit = 512
@@ -42,6 +42,14 @@ func (m *Model) initForm(entry *pb.VaultEntry) tea.Cmd {
 		}
 		inputs[i] = ti
 	}
+
+	ta := textarea.New()
+	ta.Placeholder = "Additional notes, recovery codes, SSH keys..."
+	ta.SetWidth(52)
+	ta.SetHeight(5)
+	ta.CharLimit = 4096
+	ta.ShowLineNumbers = false
+	ta.Blur()
 
 	m.formShowPass = false
 	m.formErr = ""
@@ -57,7 +65,7 @@ func (m *Model) initForm(entry *pb.VaultEntry) tea.Cmd {
 		}
 		inputs[formFieldURL].SetValue(entry.Url)
 		if notes, err := m.vault.DecryptNotes(entry); err == nil {
-			inputs[formFieldNotes].SetValue(notes)
+			ta.SetValue(notes)
 		}
 	} else {
 		m.isEditing = false
@@ -65,6 +73,7 @@ func (m *Model) initForm(entry *pb.VaultEntry) tea.Cmd {
 	}
 
 	m.formInputs = inputs
+	m.formNotes = ta
 	return m.formInputs[0].Focus()
 }
 
@@ -126,18 +135,27 @@ func (m Model) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmd tea.Cmd
-	m.formInputs[m.formFocusIdx], cmd = m.formInputs[m.formFocusIdx].Update(msg)
+	if m.formFocusIdx == formFieldNotes {
+		m.formNotes, cmd = m.formNotes.Update(msg)
+	} else {
+		m.formInputs[m.formFocusIdx], cmd = m.formInputs[m.formFocusIdx].Update(msg)
+	}
 	return m, cmd
 }
 
 func (m *Model) focusFormInput() tea.Cmd {
-	cmds := make([]tea.Cmd, formFieldCount)
-	for i := range formFieldCount {
+	cmds := make([]tea.Cmd, 0, formFieldCount)
+	for i := range formFieldNotes {
 		if i == m.formFocusIdx {
-			cmds[i] = m.formInputs[i].Focus()
+			cmds = append(cmds, m.formInputs[i].Focus())
 		} else {
 			m.formInputs[i].Blur()
 		}
+	}
+	if m.formFocusIdx == formFieldNotes {
+		cmds = append(cmds, m.formNotes.Focus())
+	} else {
+		m.formNotes.Blur()
 	}
 	return tea.Batch(cmds...)
 }
@@ -147,7 +165,7 @@ func (m Model) submitForm() (tea.Model, tea.Cmd) {
 	username := strings.TrimSpace(m.formInputs[formFieldUsername].Value())
 	password := m.formInputs[formFieldPassword].Value()
 	url := strings.TrimSpace(m.formInputs[formFieldURL].Value())
-	notes := m.formInputs[formFieldNotes].Value()
+	notes := m.formNotes.Value()
 
 	if title == "" {
 		m.formErr = "Field \"Title\" is required"
@@ -192,6 +210,8 @@ func (m *Model) clearFormInputs() {
 		m.formInputs[i].SetValue("")
 		m.formInputs[i].Blur()
 	}
+	m.formNotes.SetValue("")
+	m.formNotes.Blur()
 	m.formErr = ""
 	m.isEditing = false
 	m.editingEntryID = ""
@@ -220,6 +240,11 @@ func (m Model) viewForm() string {
 		lbl := LabelStyle.Render(labels[i])
 		if m.formFocusIdx == i {
 			lbl = FocusedLabelStyle.Render("▸ " + labels[i])
+		}
+		if i == formFieldNotes {
+			b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, lbl, " ", m.formNotes.View()))
+			b.WriteString("\n\n")
+			continue
 		}
 		b.WriteString(lbl)
 		b.WriteString(" ")

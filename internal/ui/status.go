@@ -51,6 +51,24 @@ func (m Model) copyEntryPassword(entry *pb.VaultEntry) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(clearCmd, countdownCmd)
 }
 
+func (m Model) copyEntryUsername(entry *pb.VaultEntry) (tea.Model, tea.Cmd) {
+	if strings.TrimSpace(entry.Username) == "" {
+		m.statusMsg = fmt.Sprintf("No username set for \"%s\"", entry.Title)
+		m.statusIsErr = true
+		return m, nil
+	}
+
+	if err := clipboard.Copy(entry.Username); err != nil {
+		m.statusMsg = fmt.Sprintf("Failed to copy username: %v", err)
+		m.statusIsErr = true
+		return m, nil
+	}
+
+	m.statusMsg = fmt.Sprintf("Username for \"%s\" copied to clipboard", entry.Title)
+	m.statusIsErr = false
+	return m, nil
+}
+
 func (m Model) renderStatusFooter(hints string) string {
 	var lines []string
 

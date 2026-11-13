@@ -65,6 +65,9 @@ func (m Model) updateDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "c":
 			return m.copyEntryPassword(m.selectedEntry)
 
+		case "u":
+			return m.copyEntryUsername(m.selectedEntry)
+
 		case "e":
 			entry := m.selectedEntry
 			m.cleanupSensitiveState()
@@ -128,9 +131,13 @@ func (m Model) viewDetail() string {
 	b.WriteString(" ")
 	b.WriteString(ValueStyle.Render(nonEmpty(e.Url, "—")))
 	b.WriteString("\n")
-	b.WriteString(LabelStyle.Render("Notes:"))
-	b.WriteString(" ")
-	b.WriteString(ValueStyle.Render(nonEmpty(m.decryptedNotes, "—")))
+	notesBlock := lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		LabelStyle.Render("Notes:"),
+		" ",
+		ValueStyle.Render(nonEmpty(m.decryptedNotes, "—")),
+	)
+	b.WriteString(notesBlock)
 	b.WriteString("\n\n")
 
 	createdStr := formatUnixTime(e.CreatedAt)
@@ -142,6 +149,7 @@ func (m Model) viewDetail() string {
 	hints := strings.Join([]string{
 		renderKeyHint("v", "show/hide password"),
 		renderKeyHint("c", "copy password (15s)"),
+		renderKeyHint("u", "copy username"),
 		renderKeyHint("e", "edit"),
 		renderKeyHint("d", "delete"),
 		renderKeyHint("esc", "back"),

@@ -53,17 +53,35 @@ func TestUIStateMachineFlow(t *testing.T) {
 		t.Fatalf("expected Ctrl+G to generate a strong password, got %q", genPw)
 	}
 
+	// Tab to URL, Tab to Notes (textarea), and enter multiline notes
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	multilineNotes := "code-1111\ncode-2222"
+	m.formNotes.SetValue(multilineNotes)
+
 	// Save form via Ctrl+S -> transitions to StateDetail with password hidden by default
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	m = updated.(Model)
 	if m.state != StateDetail {
 		t.Fatalf("expected StateDetail after saving form, got %v (formErr: %s)", m.state, m.formErr)
 	}
+	if m.decryptedNotes != multilineNotes {
+		t.Fatalf("expected multiline notes %q, got %q", multilineNotes, m.decryptedNotes)
+	}
 	if m.passwordRevealed {
 		t.Fatalf("expected password to be hidden by default in StateDetail")
 	}
 	if strings.Contains(m.View(), genPw) {
 		t.Fatalf("expected hidden password not to appear in View() before pressing 'v'")
+	}
+
+	// Press 'u' to copy username without starting the 15s auto-clear timer
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	m = updated.(Model)
+	if m.clipboardCountdown != 0 {
+		t.Fatalf("expected clipboardCountdown to remain 0 after copying username, got %d", m.clipboardCountdown)
 	}
 
 	// Press 'v' to temporarily decrypt and reveal the password via entryKey

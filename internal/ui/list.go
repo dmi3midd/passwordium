@@ -106,6 +106,15 @@ func (m Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m.copyEntryPassword(item.entry)
 
+		case "u":
+			item, ok := m.list.SelectedItem().(entryItem)
+			if !ok || item.entry == nil {
+				m.statusMsg = "No entry selected to copy"
+				m.statusIsErr = true
+				return m, nil
+			}
+			return m.copyEntryUsername(item.entry)
+
 		case "d":
 			item, ok := m.list.SelectedItem().(entryItem)
 			if !ok || item.entry == nil {
@@ -136,6 +145,7 @@ func (m Model) viewList() string {
 		renderKeyHint("n", "new"),
 		renderKeyHint("enter", "view"),
 		renderKeyHint("c", "copy password"),
+		renderKeyHint("u", "copy username"),
 		renderKeyHint("d", "delete"),
 		renderKeyHint("s", "search"),
 		renderKeyHint("q", "quit"),
