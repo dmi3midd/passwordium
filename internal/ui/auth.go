@@ -108,7 +108,7 @@ func (m Model) submitAuth() (tea.Model, tea.Cmd) {
 		m.state = StateList
 		m.statusMsg = "✨ New encrypted vault created successfully"
 		m.statusIsErr = false
-		return m, nil
+		return m, m.resetInactivityTimer()
 	}
 
 	pwBytes := []byte(pw)
@@ -130,7 +130,7 @@ func (m Model) submitAuth() (tea.Model, tea.Cmd) {
 	m.state = StateList
 	m.statusMsg = "🔓 Vault unlocked successfully"
 	m.statusIsErr = false
-	return m, nil
+	return m, m.resetInactivityTimer()
 }
 
 func (m *Model) clearAuthInputs() {
@@ -139,6 +139,7 @@ func (m *Model) clearAuthInputs() {
 		m.authInputs[i].Blur()
 	}
 	m.authErr = ""
+	m.authNotice = ""
 }
 
 func (m Model) viewAuth() string {
@@ -181,6 +182,12 @@ func (m Model) viewAuth() string {
 		b.WriteString(lbl)
 		b.WriteString(" ")
 		b.WriteString(m.authInputs[0].View())
+		b.WriteString("\n")
+	}
+
+	if m.authNotice != "" {
+		b.WriteString("\n")
+		b.WriteString(NoticeStyle.Render(m.authNotice))
 		b.WriteString("\n")
 	}
 

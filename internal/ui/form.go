@@ -206,12 +206,16 @@ func (m Model) submitForm() (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) clearFormInputs() {
-	for i := range m.formInputs {
-		m.formInputs[i].SetValue("")
-		m.formInputs[i].Blur()
+	if len(m.formInputs) > 0 {
+		for i := range m.formInputs {
+			m.formInputs[i].SetValue("")
+			m.formInputs[i].Blur()
+		}
+		m.formNotes.SetValue("")
+		m.formNotes.Blur()
+		m.formInputs = nil
+		m.formNotes = textarea.Model{}
 	}
-	m.formNotes.SetValue("")
-	m.formNotes.Blur()
 	m.formErr = ""
 	m.isEditing = false
 	m.editingEntryID = ""

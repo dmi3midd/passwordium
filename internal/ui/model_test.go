@@ -108,3 +108,44 @@ func TestUIStateMachineFlow(t *testing.T) {
 		m.vault.Close()
 	}
 }
+
+func TestAutoLockOnInactivity(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultPath := filepath.Join(tmpDir, "vault.enc")
+
+	m := NewModel(vaultPath)
+	m.authInputs[0].SetValue("MasterPass#2026")
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	m.authInputs[1].SetValue("MasterPass#2026")
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.state != StateList || m.vault == nil {
+		t.Fatalf("expected unlocked StateList, got state=%v", m.state)
+	}
+
+	// Simulate stale autoLockMsg from an earlier sequence
+	staleSeq := m.inactivitySeq - 1
+	updated, _ = m.Update(autoLockMsg{seq: staleSeq})
+	m = updated.(Model)
+	if m.state != StateList || m.vault == nil {
+		t.Fatalf("expected stale autoLockMsg not to lock the vault")
+	}
+
+	// Simulate active autoLockMsg matching current inactivitySeq
+	updated, _ = m.Update(autoLockMsg{seq: m.inactivitySeq})
+	m = updated.(Model)
+	if m.state != StateAuth {
+		t.Fatalf("expected StateAuth after auto-lock, got %v", m.state)
+	}
+	if m.vault != nil {
+		t.Fatalf("expected vault to be closed and cleared on auto-lock")
+	}
+	if m.isNewVault {
+		t.Fatalf("expected isNewVault=false after vault was created and locked")
+	}
+	if !strings.Contains(m.View(), "inactivity") {
+		t.Fatalf("expected auth view to show inactivity notice, got:\n%s", m.View())
+	}
+}

@@ -22,6 +22,12 @@ const (
 	StateForm
 )
 
+const autoLockDuration = 3 * time.Minute
+
+type autoLockMsg struct {
+	seq int
+}
+
 // Model is the main Bubble Tea finite state machine model for Passwordium.
 type Model struct {
 	state     SessionState
@@ -36,6 +42,7 @@ type Model struct {
 	authInputs   []textinput.Model
 	authFocusIdx int
 	authErr      string
+	authNotice   string
 
 	// StateList fields
 	list list.Model
@@ -60,6 +67,7 @@ type Model struct {
 	statusIsErr        bool
 	clipboardSeq       int
 	clipboardCountdown int
+	inactivitySeq      int
 }
 
 // NewModel initializes the root Bubble Tea model starting in StateAuth.
@@ -111,6 +119,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case autoLockMsg:
+		if msg.seq == m.inactivitySeq && m.state != StateAuth && m.vault != nil {
+			m.lockVault("Session locked due to 3 minutes of inactivity")
+			return m, textinput.Blink
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			m.cleanupSensitiveState()
@@ -121,18 +136,61 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	var lockCmd tea.Cmd
+	if _, isKey := msg.(tea.KeyMsg); isKey && m.state != StateAuth {
+		lockCmd = m.resetInactivityTimer()
+	}
+
+	var (
+		nextModel tea.Model
+		cmd       tea.Cmd
+	)
 	switch m.state {
 	case StateAuth:
-		return m.updateAuth(msg)
+		nextModel, cmd = m.updateAuth(msg)
 	case StateList:
-		return m.updateList(msg)
+		nextModel, cmd = m.updateList(msg)
 	case StateDetail:
-		return m.updateDetail(msg)
+		nextModel, cmd = m.updateDetail(msg)
 	case StateForm:
-		return m.updateForm(msg)
+		nextModel, cmd = m.updateForm(msg)
 	default:
 		return m, nil
 	}
+
+	if lockCmd != nil {
+		return nextModel, tea.Batch(lockCmd, cmd)
+	}
+	return nextModel, cmd
+}
+
+func (m *Model) resetInactivityTimer() tea.Cmd {
+	m.inactivitySeq++
+	seq := m.inactivitySeq
+	return tea.Tick(autoLockDuration, func(t time.Time) tea.Msg {
+		return autoLockMsg{seq: seq}
+	})
+}
+
+func (m *Model) lockVault(notice string) {
+	m.inactivitySeq++
+	m.cleanupSensitiveState()
+	m.clearFormInputs()
+	m.list.SetItems(nil)
+	m.list.ResetFilter()
+	if m.vault != nil {
+		m.vault.Close()
+		m.vault = nil
+	}
+	m.statusMsg = ""
+	m.statusIsErr = false
+
+	m.isNewVault = !vault.Exists(m.vaultPath)
+	m.authInputs = newAuthInputs(m.isNewVault)
+	m.authFocusIdx = 0
+	m.authErr = ""
+	m.authNotice = notice
+	m.state = StateAuth
 }
 
 func (m Model) View() string {
