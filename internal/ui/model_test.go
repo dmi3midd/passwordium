@@ -149,3 +149,57 @@ func TestAutoLockOnInactivity(t *testing.T) {
 		t.Fatalf("expected auth view to show inactivity notice, got:\n%s", m.View())
 	}
 }
+
+func TestConfirmDeleteFlow(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultPath := filepath.Join(tmpDir, "vault.enc")
+
+	m := NewModel(vaultPath)
+	m.authInputs[0].SetValue("MasterPass#2026")
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	m.authInputs[1].SetValue("MasterPass#2026")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if _, err := m.vault.AddEntry("GitHub", "octocat", "secret-pw", "https://github.com", ""); err != nil {
+		t.Fatalf("AddEntry failed: %v", err)
+	}
+	m.refreshListItems("")
+
+	// Press 'd' in StateList -> opens StateConfirmDelete instead of deleting immediately
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+	if m.state != StateConfirmDelete {
+		t.Fatalf("expected StateConfirmDelete after pressing 'd', got %v", m.state)
+	}
+	if len(m.vault.Entries()) != 1 {
+		t.Fatalf("expected entry not to be deleted before confirmation")
+	}
+
+	// Press 'n' -> cancels deletion and returns to StateList
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = updated.(Model)
+	if m.state != StateList {
+		t.Fatalf("expected StateList after pressing 'n', got %v", m.state)
+	}
+	if len(m.vault.Entries()) != 1 {
+		t.Fatalf("expected entry to remain after cancelling deletion")
+	}
+
+	// Press 'd' then 'y' -> deletes entry and returns to StateList
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = updated.(Model)
+	if m.state != StateList {
+		t.Fatalf("expected StateList after confirming delete, got %v", m.state)
+	}
+	if len(m.vault.Entries()) != 0 {
+		t.Fatalf("expected entry to be deleted after pressing 'y', got %d entries", len(m.vault.Entries()))
+	}
+
+	if m.vault != nil {
+		m.vault.Close()
+	}
+}

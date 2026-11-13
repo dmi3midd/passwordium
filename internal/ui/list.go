@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -120,15 +119,7 @@ func (m Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !ok || item.entry == nil {
 				return m, nil
 			}
-			title := item.entry.Title
-			if err := m.vault.DeleteEntry(item.entry.Id); err != nil {
-				m.statusMsg = fmt.Sprintf("Failed to delete entry: %v", err)
-				m.statusIsErr = true
-				return m, nil
-			}
-			m.refreshListItems("")
-			m.statusMsg = fmt.Sprintf("Entry \"%s\" deleted", title)
-			m.statusIsErr = false
+			m.requestDelete(item.entry, StateList)
 			return m, nil
 		}
 	}

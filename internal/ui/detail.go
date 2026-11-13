@@ -76,18 +76,7 @@ func (m Model) updateDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 
 		case "d":
-			id := m.selectedEntry.Id
-			title := m.selectedEntry.Title
-			m.cleanupSensitiveState()
-			if err := m.vault.DeleteEntry(id); err != nil {
-				m.statusMsg = fmt.Sprintf("Failed to delete entry: %v", err)
-				m.statusIsErr = true
-				return m, nil
-			}
-			m.refreshListItems("")
-			m.state = StateList
-			m.statusMsg = fmt.Sprintf("Entry \"%s\" deleted", title)
-			m.statusIsErr = false
+			m.requestDelete(m.selectedEntry, StateDetail)
 			return m, nil
 		}
 	}

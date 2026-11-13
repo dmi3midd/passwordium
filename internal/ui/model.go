@@ -20,6 +20,7 @@ const (
 	StateList
 	StateDetail
 	StateForm
+	StateConfirmDelete
 )
 
 const autoLockDuration = 3 * time.Minute
@@ -61,6 +62,11 @@ type Model struct {
 	formFocusIdx   int
 	formShowPass   bool
 	formErr        string
+
+	// StateConfirmDelete fields
+	deleteEntryID     string
+	deleteEntryTitle  string
+	deleteReturnState SessionState
 
 	// Clipboard & Status notifications
 	statusMsg          string
@@ -154,6 +160,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		nextModel, cmd = m.updateDetail(msg)
 	case StateForm:
 		nextModel, cmd = m.updateForm(msg)
+	case StateConfirmDelete:
+		nextModel, cmd = m.updateConfirmDelete(msg)
 	default:
 		return m, nil
 	}
@@ -176,6 +184,7 @@ func (m *Model) lockVault(notice string) {
 	m.inactivitySeq++
 	m.cleanupSensitiveState()
 	m.clearFormInputs()
+	m.clearDeletePrompt()
 	m.list.SetItems(nil)
 	m.list.ResetFilter()
 	if m.vault != nil {
@@ -204,6 +213,8 @@ func (m Model) View() string {
 		content = m.viewDetail()
 	case StateForm:
 		content = m.viewForm()
+	case StateConfirmDelete:
+		content = m.viewConfirmDelete()
 	}
 	return AppContainerStyle.Render(content)
 }
