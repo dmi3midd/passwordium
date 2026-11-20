@@ -47,4 +47,10 @@ var (
 
 	// ErrConcurrentModification is returned by Save when the underlying vault in Storage was modified since it was opened or last saved.
 	ErrConcurrentModification = errors.New("passwordium: vault was modified concurrently in storage")
+
+	// ErrSameStorage is returned when Export or Import is called with the same Storage backend as the active Vault.
+	ErrSameStorage = errors.New("passwordium: source and destination storage must not be the same")
+
+	// ErrInvalidConflictPolicy is returned when Import is called with an unrecognized ConflictPolicy.
+	ErrInvalidConflictPolicy = errors.New("passwordium: invalid import conflict policy")
 )

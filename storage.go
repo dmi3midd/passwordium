@@ -403,6 +403,42 @@ func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{}
 }
 
+// NewMemoryStorageWithData returns a MemoryStorage pre-populated with a defensive copy
+// of data. This is useful when importing or opening an encrypted vault byte slice
+// received from a mobile file picker, clipboard, or network stream.
+func NewMemoryStorageWithData(data []byte) *MemoryStorage {
+	return &MemoryStorage{
+		exists: true,
+		data:   bytes.Clone(data),
+	}
+}
+
+// sameStorage reports whether a and b refer to the same underlying storage target.
+func sameStorage(a, b Storage) (bool, error) {
+	if a == nil || b == nil {
+		return false, nil
+	}
+	if a == b {
+		return true, nil
+	}
+	fa, okA := a.(*FileStorage)
+	fb, okB := b.(*FileStorage)
+	if !okA || !okB || fa.path == "" || fb.path == "" {
+		return false, nil
+	}
+	absA, errA := filepath.Abs(fa.path)
+	absB, errB := filepath.Abs(fb.path)
+	if errA == nil && errB == nil && absA == absB {
+		return true, nil
+	}
+	infoA, errA := os.Lstat(fa.path)
+	infoB, errB := os.Lstat(fb.path)
+	if errA == nil && errB == nil && os.SameFile(infoA, infoB) {
+		return true, nil
+	}
+	return false, nil
+}
+
 // Exists reports whether any vault data has been saved in memory.
 func (m *MemoryStorage) Exists(ctx context.Context) (bool, error) {
 	if err := ctx.Err(); err != nil {

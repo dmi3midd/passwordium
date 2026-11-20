@@ -875,5 +875,332 @@ func FuzzPadUnpadSecret(f *testing.F) {
 			t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(data))
 		}
 		_, _ = unpadSecret(data)
+		_ = validateSecretPayloadWire(data)
+	})
+}
+
+func TestVaultExportSnapshotAndRekey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "active.psdm")
+	srcStore := NewFileStorage(srcPath)
+	srcPass := []byte("source-master-pass")
+
+	v, err := Create(ctx, srcStore, srcPass, fastTestArgon2())
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer func() { _ = v.Close() }()
+
+	id1, err := v.Put(ctx, EntryMeta{
+		ID:       "entry-1",
+		Title:    "GitHub",
+		Username: "octocat",
+		URL:      "https://github.com",
+		Tags:     []string{"dev"},
+	}, Secret{
+		Password:     "gh-secret-1",
+		Notes:        "token note",
+		CustomFields: map[string]string{"otp": "123456"},
+	})
+	if err != nil {
+		t.Fatalf("Put #1: %v", err)
+	}
+
+	// 1. Validation & safety checks on Export.
+	if err := v.Export(ctx, nil); !errors.Is(err, ErrNilStorage) {
+		t.Fatalf("Export(nil) err = %v, want ErrNilStorage", err)
+	}
+	if err := v.Export(ctx, srcStore); !errors.Is(err, ErrSameStorage) {
+		t.Fatalf("Export(same instance) err = %v, want ErrSameStorage", err)
+	}
+	if err := v.Export(ctx, NewFileStorage(srcPath)); !errors.Is(err, ErrSameStorage) {
+		t.Fatalf("Export(same path) err = %v, want ErrSameStorage", err)
+	}
+	if err := v.Export(ctx, NewMemoryStorage(), WithExportPassword(nil)); !errors.Is(err, ErrEmptyPassword) {
+		t.Fatalf("Export(empty password) err = %v, want ErrEmptyPassword", err)
+	}
+	if err := v.Export(ctx, NewMemoryStorage(), WithArgon2Params(Argon2ParamsMiB(1, 16, 1))); !errors.Is(err, ErrEmptyPassword) {
+		t.Fatalf("Export(Argon2Params without password) err = %v, want ErrEmptyPassword", err)
+	}
+	if err := v.Export(ctx, NewMemoryStorage(), WithExportPassword([]byte("pw")), WithArgon2Params(Argon2Params{Time: 1, MemoryKiB: 64, Threads: 1})); !errors.Is(err, ErrInvalidArgon2Params) {
+		t.Fatalf("Export(weak Argon2Params) err = %v, want ErrInvalidArgon2Params", err)
+	}
+
+	// 2. Snapshot Export (same credentials, no secret decryption) leaves v dirty state untouched.
+	snapStore := NewMemoryStorage()
+	if err := v.Export(ctx, snapStore); err != nil {
+		t.Fatalf("Export snapshot: %v", err)
+	}
+	if !v.Dirty() {
+		t.Fatal("Export must not clear Dirty() on the active vault")
+	}
+	// Refuses to overwrite existing destination by default.
+	if err := v.Export(ctx, snapStore); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("second Export without overwrite err = %v, want ErrAlreadyExists", err)
+	}
+
+	snapVault, err := Open(ctx, snapStore, srcPass)
+	if err != nil {
+		t.Fatalf("Open snapshot: %v", err)
+	}
+	sec1, err := snapVault.GetSecret(id1)
+	if err != nil || sec1.Password != "gh-secret-1" || sec1.CustomFields["otp"] != "123456" {
+		t.Fatalf("snapshot GetSecret = %+v, err=%v", sec1, err)
+	}
+	_ = snapVault.Close()
+
+	// 3. Re-keyed Export (new password + new salt + custom Argon2 params + WithOverwrite(true)).
+	exportPass := []byte("mobile-transfer-password")
+	exportPassOrig := bytes.Clone(exportPass)
+	if err := v.Export(ctx, snapStore,
+		WithOverwrite(true),
+		WithExportPassword(exportPass),
+		fastTestArgon2(),
+	); err != nil {
+		t.Fatalf("Export re-keyed: %v", err)
+	}
+	if !bytes.Equal(exportPass, exportPassOrig) {
+		t.Fatal("WithExportPassword mutated caller password slice")
+	}
+
+	// Old password must no longer open the overwritten export.
+	if _, err := Open(ctx, snapStore, srcPass); !errors.Is(err, ErrInvalidPassword) {
+		t.Fatalf("Open re-keyed export with old password err = %v, want ErrInvalidPassword", err)
+	}
+
+	// Round-trip via raw bytes and NewMemoryStorageWithData (mobile/CLI file transfer flow).
+	exportedBytes, err := snapStore.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load exported bytes: %v", err)
+	}
+	mobileStore := NewMemoryStorageWithData(exportedBytes)
+	rekeyedVault, err := Open(ctx, mobileStore, exportPass)
+	if err != nil {
+		t.Fatalf("Open re-keyed export: %v", err)
+	}
+	defer func() { _ = rekeyedVault.Close() }()
+
+	secRekeyed, err := rekeyedVault.GetSecret(id1)
+	if err != nil || secRekeyed.Password != "gh-secret-1" || secRekeyed.Notes != "token note" || secRekeyed.CustomFields["otp"] != "123456" {
+		t.Fatalf("re-keyed GetSecret = %+v, err=%v", secRekeyed, err)
+	}
+}
+
+func TestVaultImportConflictPoliciesAndAtomicity(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	passA := []byte("vault-A-pass")
+	passB := []byte("vault-B-pass")
+
+	// Build source vault B with 3 entries:
+	// - "shared-older": older UpdatedAt than vault A
+	// - "shared-newer": newer UpdatedAt than vault A
+	// - "only-in-b":    unique to vault B
+	storeB := NewMemoryStorage()
+	vB, err := Create(ctx, storeB, passB, fastTestArgon2())
+	if err != nil {
+		t.Fatalf("Create B: %v", err)
+	}
+	for _, e := range []struct {
+		id, title, pw string
+		updatedAt     int64
+	}{
+		{"shared-older", "B-Older", "pw-from-B-older", 1000},
+		{"shared-newer", "B-Newer", "pw-from-B-newer", 3000},
+		{"only-in-b", "B-Unique", "pw-from-B-unique", 2000},
+	} {
+		if _, err := vB.Put(ctx, EntryMeta{ID: e.id, Title: e.title, Tags: []string{"from-b"}}, Secret{
+			Password:     e.pw,
+			CustomFields: map[string]string{"src": "B"},
+		}); err != nil {
+			t.Fatalf("vB.Put(%s): %v", e.id, err)
+		}
+		vB.entries[e.id].updatedAt = e.updatedAt
+	}
+	if err := vB.Save(ctx); err != nil {
+		t.Fatalf("vB.Save: %v", err)
+	}
+	_ = vB.Close()
+
+	newBaseVaultA := func(t *testing.T) (*Vault, *MemoryStorage) {
+		t.Helper()
+		sA := NewMemoryStorage()
+		vA, err := Create(ctx, sA, passA, fastTestArgon2())
+		if err != nil {
+			t.Fatalf("Create A: %v", err)
+		}
+		for _, e := range []struct {
+			id, title, pw string
+			updatedAt     int64
+		}{
+			{"shared-older", "A-Newer", "pw-from-A-newer", 2000},
+			{"shared-newer", "A-Older", "pw-from-A-older", 1000},
+			{"only-in-a", "A-Unique", "pw-from-A-unique", 1500},
+		} {
+			if _, err := vA.Put(ctx, EntryMeta{ID: e.id, Title: e.title, Tags: []string{"from-a"}}, Secret{
+				Password:     e.pw,
+				CustomFields: map[string]string{"src": "A"},
+			}); err != nil {
+				t.Fatalf("vA.Put(%s): %v", e.id, err)
+			}
+			vA.entries[e.id].updatedAt = e.updatedAt
+		}
+		if err := vA.Save(ctx); err != nil {
+			t.Fatalf("vA.Save: %v", err)
+		}
+		return vA, sA
+	}
+
+	// 1. Default policy: ConflictKeepNewer.
+	t.Run("ConflictKeepNewer", func(t *testing.T) {
+		t.Parallel()
+		vA, _ := newBaseVaultA(t)
+		defer func() { _ = vA.Close() }()
+
+		res, err := vA.Import(ctx, storeB, passB)
+		if err != nil {
+			t.Fatalf("Import(KeepNewer): %v", err)
+		}
+		if res != (ImportResult{Added: 1, Updated: 1, Skipped: 1}) {
+			t.Fatalf("ImportResult = %+v, want {Added:1 Updated:1 Skipped:1}", res)
+		}
+		if sec, err := vA.GetSecret("shared-older"); err != nil || sec.Password != "pw-from-A-newer" {
+			t.Fatalf("shared-older secret = %+v, err=%v", sec, err)
+		}
+		if sec, err := vA.GetSecret("shared-newer"); err != nil || sec.Password != "pw-from-B-newer" {
+			t.Fatalf("shared-newer secret = %+v, err=%v", sec, err)
+		}
+		metaNewer, err := vA.GetMeta("shared-newer")
+		if err != nil || metaNewer.Version != 2 {
+			t.Fatalf("shared-newer Version = %d, want 2 (err=%v)", metaNewer.Version, err)
+		}
+		if sec, err := vA.GetSecret("only-in-b"); err != nil || sec.Password != "pw-from-B-unique" {
+			t.Fatalf("only-in-b secret = %+v, err=%v", sec, err)
+		}
+	})
+
+	// 2. Policy: ConflictKeepExisting.
+	t.Run("ConflictKeepExisting", func(t *testing.T) {
+		t.Parallel()
+		vA, _ := newBaseVaultA(t)
+		defer func() { _ = vA.Close() }()
+
+		res, err := vA.Import(ctx, storeB, passB, WithConflictPolicy(ConflictKeepExisting))
+		if err != nil {
+			t.Fatalf("Import(KeepExisting): %v", err)
+		}
+		if res != (ImportResult{Added: 1, Updated: 0, Skipped: 2}) {
+			t.Fatalf("ImportResult = %+v, want {Added:1 Updated:0 Skipped:2}", res)
+		}
+		if sec, err := vA.GetSecret("shared-newer"); err != nil || sec.Password != "pw-from-A-older" {
+			t.Fatalf("shared-newer should stay A's secret, got %+v, err=%v", sec, err)
+		}
+	})
+
+	// 3. Policy: ConflictOverwrite.
+	t.Run("ConflictOverwrite", func(t *testing.T) {
+		t.Parallel()
+		vA, _ := newBaseVaultA(t)
+		defer func() { _ = vA.Close() }()
+
+		res, err := vA.Import(ctx, storeB, passB, WithConflictPolicy(ConflictOverwrite))
+		if err != nil {
+			t.Fatalf("Import(Overwrite): %v", err)
+		}
+		if res != (ImportResult{Added: 1, Updated: 2, Skipped: 0}) {
+			t.Fatalf("ImportResult = %+v, want {Added:1 Updated:2 Skipped:0}", res)
+		}
+		if sec, err := vA.GetSecret("shared-older"); err != nil || sec.Password != "pw-from-B-older" {
+			t.Fatalf("shared-older should be overwritten by B, got %+v, err=%v", sec, err)
+		}
+	})
+
+	// 4. Policy: ConflictKeepBoth.
+	t.Run("ConflictKeepBoth", func(t *testing.T) {
+		t.Parallel()
+		vA, _ := newBaseVaultA(t)
+		defer func() { _ = vA.Close() }()
+
+		res, err := vA.Import(ctx, storeB, passB, WithConflictPolicy(ConflictKeepBoth))
+		if err != nil {
+			t.Fatalf("Import(KeepBoth): %v", err)
+		}
+		if res != (ImportResult{Added: 3, Updated: 0, Skipped: 0}) {
+			t.Fatalf("ImportResult = %+v, want {Added:3 Updated:0 Skipped:0}", res)
+		}
+		if vA.Len() != 6 {
+			t.Fatalf("Len() = %d, want 6", vA.Len())
+		}
+	})
+
+	// 5. Validation, DoS protection, and atomic rollback on corrupted secret or failed autosave.
+	t.Run("ValidationAndAtomicity", func(t *testing.T) {
+		t.Parallel()
+		vA, sA := newBaseVaultA(t)
+		defer func() { _ = vA.Close() }()
+
+		if _, err := vA.Import(ctx, nil, passB); !errors.Is(err, ErrNilStorage) {
+			t.Fatalf("Import(nil) err = %v, want ErrNilStorage", err)
+		}
+		if _, err := vA.Import(ctx, sA, passA); !errors.Is(err, ErrSameStorage) {
+			t.Fatalf("Import(same storage) err = %v, want ErrSameStorage", err)
+		}
+		if _, err := vA.Import(ctx, storeB, []byte("wrong-pass")); !errors.Is(err, ErrInvalidPassword) {
+			t.Fatalf("Import(wrong password) err = %v, want ErrInvalidPassword", err)
+		}
+		if _, err := vA.Import(ctx, storeB, passB, WithConflictPolicy(ConflictPolicy(99))); !errors.Is(err, ErrInvalidConflictPolicy) {
+			t.Fatalf("Import(invalid policy) err = %v, want ErrInvalidConflictPolicy", err)
+		}
+		if _, err := vA.Import(ctx, storeB, passB, WithMaxArgon2Params(Argon2Params{Time: 1, MemoryKiB: 32, Threads: 1})); !errors.Is(err, ErrInvalidArgon2Params) {
+			t.Fatalf("Import(tight MaxArgon2Params) err = %v, want ErrInvalidArgon2Params", err)
+		}
+
+		// Craft a source vault where one entry's encrypted secret is tampered with:
+		// Import must reject with ErrSecretCorrupted and leave vA completely unmodified.
+		corruptStore := NewMemoryStorage()
+		vCorrupt, err := Create(ctx, corruptStore, passB, fastTestArgon2())
+		if err != nil {
+			t.Fatalf("Create corrupt source: %v", err)
+		}
+		if _, err := vCorrupt.Put(ctx, EntryMeta{ID: "good", Title: "Good"}, Secret{Password: "good"}); err != nil {
+			t.Fatalf("Put good: %v", err)
+		}
+		if _, err := vCorrupt.Put(ctx, EntryMeta{ID: "bad", Title: "Bad"}, Secret{Password: "bad"}); err != nil {
+			t.Fatalf("Put bad: %v", err)
+		}
+		vCorrupt.entries["bad"].encryptedSecret[0] ^= 0xff
+		if err := vCorrupt.Save(ctx); err != nil {
+			t.Fatalf("Save corrupt source: %v", err)
+		}
+		_ = vCorrupt.Close()
+
+		if _, err := vA.Import(ctx, corruptStore, passB); !errors.Is(err, ErrSecretCorrupted) {
+			t.Fatalf("Import(corrupted entry secret) err = %v, want ErrSecretCorrupted", err)
+		}
+		if _, err := vA.GetMeta("good"); !errors.Is(err, ErrEntryNotFound) {
+			t.Fatalf("atomic Import leaked 'good' entry from partially corrupted source: %v", err)
+		}
+		if vA.Dirty() || vA.Len() != 3 {
+			t.Fatalf("vA mutated on failed Import: Dirty=%v Len=%d", vA.Dirty(), vA.Len())
+		}
+
+		// Failed autosave during Import must roll back vA's entries and dirty flag.
+		fs := &failingStorage{inner: sA, err: errors.New("disk full")}
+		vA.mu.Lock()
+		vA.store = fs
+		vA.autoSave = true
+		vA.mu.Unlock()
+		fs.failSave.Store(true)
+
+		if _, err := vA.Import(ctx, storeB, passB); !errors.Is(err, fs.err) {
+			t.Fatalf("Import with failing autosave err = %v, want %v", err, fs.err)
+		}
+		if vA.Dirty() || vA.Len() != 3 {
+			t.Fatalf("vA not rolled back after failed autosave Import: Dirty=%v Len=%d", vA.Dirty(), vA.Len())
+		}
 	})
 }

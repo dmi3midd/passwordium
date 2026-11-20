@@ -20,7 +20,7 @@ var uuidV4Regex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89a
 
 // fastTestArgon2 uses the unexported weak-params hook so unit tests stay fast;
 // public callers cannot go below the 16 MiB Create floor.
-func fastTestArgon2() CreateOption {
+func fastTestArgon2() CreateExportOption {
 	return withUnsafeArgon2Params(Argon2Params{
 		Time:      1,
 		MemoryKiB: 64,

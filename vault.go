@@ -15,6 +15,7 @@ import (
 
 	"github.com/dmi3midd/passwordium/internal/crypto"
 	"github.com/dmi3midd/passwordium/internal/vaultpb"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -135,6 +136,78 @@ func unpadSecret(padded []byte) ([]byte, error) {
 		}
 	}
 	return nil, ErrSecretCorrupted
+}
+
+// validateSecretPayloadWire verifies that b is a syntactically valid protobuf
+// encoding of vaultpb.SecretPayload without allocating Go strings or maps on the heap.
+func validateSecretPayloadWire(b []byte) error {
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return ErrSecretCorrupted
+		}
+		b = b[n:]
+
+		switch num {
+		case 1, 2: // password, notes (string)
+			if typ != protowire.BytesType {
+				return ErrSecretCorrupted
+			}
+			_, m := protowire.ConsumeBytes(b)
+			if m < 0 {
+				return ErrSecretCorrupted
+			}
+			b = b[m:]
+		case 3: // custom_fields (map<string, string> entry message)
+			if typ != protowire.BytesType {
+				return ErrSecretCorrupted
+			}
+			entryBytes, m := protowire.ConsumeBytes(b)
+			if m < 0 {
+				return ErrSecretCorrupted
+			}
+			if err := validateMapEntryWire(entryBytes); err != nil {
+				return err
+			}
+			b = b[m:]
+		default:
+			m := protowire.ConsumeFieldValue(num, typ, b)
+			if m < 0 {
+				return ErrSecretCorrupted
+			}
+			b = b[m:]
+		}
+	}
+	return nil
+}
+
+func validateMapEntryWire(b []byte) error {
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return ErrSecretCorrupted
+		}
+		b = b[n:]
+
+		switch num {
+		case 1, 2: // key, value (string)
+			if typ != protowire.BytesType {
+				return ErrSecretCorrupted
+			}
+			_, m := protowire.ConsumeBytes(b)
+			if m < 0 {
+				return ErrSecretCorrupted
+			}
+			b = b[m:]
+		default:
+			m := protowire.ConsumeFieldValue(num, typ, b)
+			if m < 0 {
+				return ErrSecretCorrupted
+			}
+			b = b[m:]
+		}
+	}
+	return nil
 }
 
 // deriveVaultCiphers runs Argon2id + HKDF-SHA256, initializes one AEAD per subkey,
@@ -661,6 +734,377 @@ func (v *Vault) Save(ctx context.Context) error {
 	}
 
 	return v.saveLocked(ctx)
+}
+
+// Export writes a complete encrypted snapshot of the vault's current in-memory state
+// to dst without modifying the active Vault's dirty state, version, or backing Storage.
+//
+// By default:
+//   - Export refuses to overwrite an existing vault in dst (returning ErrAlreadyExists)
+//     unless WithOverwrite(true) is provided.
+//   - Export seals the snapshot using the active vault's header parameters and key
+//     hierarchy (with a fresh 24-byte outer nonce), without decrypting entry secrets.
+//
+// When WithExportPassword(newPassword) is supplied (optionally combined with
+// WithArgon2Params), Export generates a fresh 32-byte random salt, derives a new
+// key hierarchy, and re-encrypts every entry's padded secret payload in place
+// (wiping each temporary byte buffer immediately without allocating Go strings).
+func (v *Vault) Export(ctx context.Context, dst Storage, opts ...ExportOption) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if dst == nil {
+		return ErrNilStorage
+	}
+
+	var cfg exportConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt.applyExport(&cfg)
+		}
+	}
+
+	if cfg.hasPassword && len(cfg.password) == 0 {
+		return ErrEmptyPassword
+	}
+	if cfg.hasArgon2Params && !cfg.hasPassword {
+		return fmt.Errorf("%w: WithExportPassword is required when overriding Argon2 parameters on Export", ErrEmptyPassword)
+	}
+	if cfg.hasArgon2Params {
+		if err := cfg.argon2Params.validateForCreate(cfg.allowWeakArgon2); err != nil {
+			return err
+		}
+	}
+
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	if v.closed {
+		return ErrVaultClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if same, err := sameStorage(v.store, dst); err != nil {
+		return err
+	} else if same {
+		return ErrSameStorage
+	}
+
+	if !cfg.overwrite {
+		if err := checkStorageNotExists(ctx, dst); err != nil {
+			return err
+		}
+	}
+
+	exportHdr := v.hdr
+	exportIndexCipher := v.indexCipher
+	var exportSecretCipher *crypto.Cipher
+
+	if cfg.hasPassword {
+		salt, err := crypto.RandomBytes(crypto.SaltSize)
+		if err != nil {
+			return err
+		}
+		copy(exportHdr.Salt[:], salt)
+		if cfg.hasArgon2Params {
+			exportHdr.Params = cfg.argon2Params
+		}
+		ic, sc, err := deriveVaultCiphers(cfg.password, exportHdr.Salt[:], exportHdr.Params)
+		if err != nil {
+			return err
+		}
+		defer ic.Close()
+		defer sc.Close()
+		exportIndexCipher = ic
+		exportSecretCipher = sc
+	}
+
+	ids := slices.Sorted(maps.Keys(v.entries))
+	pbEntries := make([]*vaultpb.Entry, 0, len(ids))
+	defer func() {
+		for _, pe := range pbEntries {
+			crypto.ZeroBytes(pe.SecretNonce)
+			crypto.ZeroBytes(pe.EncryptedSecret)
+		}
+	}()
+
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rec := v.entries[id]
+		pe := rec.toProto()
+
+		if exportSecretCipher != nil {
+			aad := entryAAD(rec.id, rec.version)
+			paddedPlain, err := v.secretCipher.Decrypt(rec.secretNonce, rec.encryptedSecret, aad)
+			if err != nil {
+				return fmt.Errorf("%w: %w", ErrSecretCorrupted, err)
+			}
+			unpadded, err := unpadSecret(paddedPlain)
+			if err != nil {
+				crypto.ZeroBytes(paddedPlain)
+				return err
+			}
+			if err := validateSecretPayloadWire(unpadded); err != nil {
+				crypto.ZeroBytes(paddedPlain)
+				return err
+			}
+			newNonce, newCT, err := exportSecretCipher.Encrypt(paddedPlain, aad)
+			crypto.ZeroBytes(paddedPlain)
+			if err != nil {
+				return fmt.Errorf("passwordium: re-encrypt exported secret: %w", err)
+			}
+			crypto.ZeroBytes(pe.SecretNonce)
+			crypto.ZeroBytes(pe.EncryptedSecret)
+			pe.SecretNonce = newNonce
+			pe.EncryptedSecret = newCT
+		}
+		pbEntries = append(pbEntries, pe)
+	}
+
+	exportVersion := v.version
+	if exportVersion == 0 {
+		exportVersion = 1
+	}
+	now := time.Now().UTC().Unix()
+
+	plaintext, err := proto.Marshal(&vaultpb.VaultData{
+		Version:   exportVersion,
+		UpdatedAt: now,
+		Entries:   pbEntries,
+	})
+	if err != nil {
+		return fmt.Errorf("passwordium: marshal exported vault: %w", err)
+	}
+	defer crypto.ZeroBytes(plaintext)
+
+	headerBytes := exportHdr.marshal()
+	nonce, ciphertext, err := exportIndexCipher.Encrypt(plaintext, headerBytes)
+	if err != nil {
+		return fmt.Errorf("passwordium: encrypt exported vault: %w", err)
+	}
+	envelope := packEnvelope(headerBytes, nonce, ciphertext)
+
+	if !cfg.overwrite {
+		if es, ok := dst.(exclusiveSaver); ok {
+			return es.SaveNew(ctx, envelope)
+		}
+		if err := checkStorageNotExists(ctx, dst); err != nil {
+			return err
+		}
+	}
+	return dst.Save(ctx, envelope)
+}
+
+// Import opens and authenticates an external encrypted vault from src using srcPassword,
+// verifies and re-encrypts its entry secrets under the active vault's secretKey without
+// allocating Go strings for secret payloads, and merges the entries into v according to
+// ConflictPolicy (defaulting to ConflictKeepNewer).
+//
+// Import is atomic: if any entry in src fails authentication or validation, or if
+// WithAutoSave persistence fails, v remains unchanged.
+//
+// Import does not mutate srcPassword; callers should zero srcPassword
+// (for example, via clear(srcPassword)) once it is no longer needed.
+func (v *Vault) Import(ctx context.Context, src Storage, srcPassword []byte, opts ...ImportOption) (ImportResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ImportResult{}, err
+	}
+	if src == nil {
+		return ImportResult{}, ErrNilStorage
+	}
+
+	cfg := defaultImportConfig()
+	for _, opt := range opts {
+		if opt != nil {
+			opt.applyImport(&cfg)
+		}
+	}
+	if !cfg.conflictPolicy.valid() {
+		return ImportResult{}, fmt.Errorf("%w: %d", ErrInvalidConflictPolicy, cfg.conflictPolicy)
+	}
+
+	v.mu.RLock()
+	closed := v.closed
+	ownStore := v.store
+	v.mu.RUnlock()
+	if closed {
+		return ImportResult{}, ErrVaultClosed
+	}
+
+	if same, err := sameStorage(ownStore, src); err != nil {
+		return ImportResult{}, err
+	} else if same {
+		return ImportResult{}, ErrSameStorage
+	}
+
+	srcVault, err := Open(ctx, src, srcPassword, cfg.openOpts...)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	defer func() { _ = srcVault.Close() }()
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if v.closed {
+		return ImportResult{}, ErrVaultClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return ImportResult{}, err
+	}
+	if same, err := sameStorage(v.store, src); err != nil {
+		return ImportResult{}, err
+	} else if same {
+		return ImportResult{}, ErrSameStorage
+	}
+
+	type stagedImport struct {
+		id       string
+		rec      *entryRecord
+		isUpdate bool
+		prev     *entryRecord
+	}
+
+	srcIDs := slices.Sorted(maps.Keys(srcVault.entries))
+	staged := make([]stagedImport, 0, len(srcIDs))
+	cleanupStaged := func() {
+		for _, s := range staged {
+			s.rec.zeroSecret()
+		}
+	}
+
+	var res ImportResult
+	for _, srcID := range srcIDs {
+		if err := ctx.Err(); err != nil {
+			cleanupStaged()
+			return ImportResult{}, err
+		}
+
+		srcRec := srcVault.entries[srcID]
+		// Always decrypt and verify every source entry secret before mutating v so
+		// corrupted entries in src are never silently skipped.
+		paddedPlain, err := srcVault.secretCipher.Decrypt(srcRec.secretNonce, srcRec.encryptedSecret, entryAAD(srcRec.id, srcRec.version))
+		if err != nil {
+			cleanupStaged()
+			return ImportResult{}, fmt.Errorf("%w: %w", ErrSecretCorrupted, err)
+		}
+		unpadded, err := unpadSecret(paddedPlain)
+		if err != nil {
+			crypto.ZeroBytes(paddedPlain)
+			cleanupStaged()
+			return ImportResult{}, err
+		}
+		if err := validateSecretPayloadWire(unpadded); err != nil {
+			crypto.ZeroBytes(paddedPlain)
+			cleanupStaged()
+			return ImportResult{}, err
+		}
+
+		targetID := srcRec.id
+		targetVersion := srcRec.version
+		targetCreatedAt := srcRec.createdAt
+		isUpdate := false
+
+		existing, exists := v.entries[targetID]
+		if exists {
+			switch cfg.conflictPolicy {
+			case ConflictKeepExisting:
+				crypto.ZeroBytes(paddedPlain)
+				res.Skipped++
+				continue
+			case ConflictKeepNewer:
+				if srcRec.updatedAt <= existing.updatedAt {
+					crypto.ZeroBytes(paddedPlain)
+					res.Skipped++
+					continue
+				}
+				isUpdate = true
+				targetVersion = max(existing.version, srcRec.version) + 1
+				targetCreatedAt = existing.createdAt
+			case ConflictOverwrite:
+				isUpdate = true
+				targetVersion = max(existing.version, srcRec.version) + 1
+				targetCreatedAt = existing.createdAt
+			case ConflictKeepBoth:
+				newID, err := generateUUIDv4()
+				if err != nil {
+					crypto.ZeroBytes(paddedPlain)
+					cleanupStaged()
+					return ImportResult{}, err
+				}
+				targetID = newID
+				targetVersion = 1
+			}
+		}
+
+		newNonce, newCT, err := v.secretCipher.Encrypt(paddedPlain, entryAAD(targetID, targetVersion))
+		crypto.ZeroBytes(paddedPlain)
+		if err != nil {
+			cleanupStaged()
+			return ImportResult{}, fmt.Errorf("passwordium: encrypt imported secret: %w", err)
+		}
+
+		newRec := &entryRecord{
+			id:              targetID,
+			version:         targetVersion,
+			title:           srcRec.title,
+			username:        srcRec.username,
+			url:             srcRec.url,
+			tags:            slices.Clone(srcRec.tags),
+			createdAt:       targetCreatedAt,
+			updatedAt:       srcRec.updatedAt,
+			secretNonce:     newNonce,
+			encryptedSecret: newCT,
+		}
+		staged = append(staged, stagedImport{
+			id:       targetID,
+			rec:      newRec,
+			isUpdate: isUpdate,
+			prev:     existing,
+		})
+		if isUpdate {
+			res.Updated++
+		} else {
+			res.Added++
+		}
+	}
+
+	if len(staged) == 0 {
+		return res, nil
+	}
+
+	prevDirty := v.dirty
+	for _, s := range staged {
+		v.entries[s.id] = s.rec
+	}
+	v.dirty = true
+
+	if v.autoSave {
+		if err := v.saveLocked(ctx); err != nil {
+			for _, s := range staged {
+				if s.isUpdate {
+					v.entries[s.id] = s.prev
+				} else {
+					delete(v.entries, s.id)
+				}
+			}
+			v.dirty = prevDirty
+			cleanupStaged()
+			return ImportResult{}, err
+		}
+	}
+
+	for _, s := range staged {
+		if s.isUpdate && s.prev != nil {
+			s.prev.zeroSecret()
+		}
+	}
+
+	return res, nil
 }
 
 func (v *Vault) marshalEnvelopeLocked(nextVersion uint64, now int64) ([]byte, error) {

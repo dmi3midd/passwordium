@@ -131,3 +131,41 @@ type SearchQuery struct {
 	Query string
 	Tags  []string
 }
+
+// ConflictPolicy controls how Vault.Import resolves entries whose ID already exists
+// in the destination vault.
+type ConflictPolicy int
+
+const (
+	// ConflictKeepNewer (the default) replaces an existing entry only when the imported
+	// entry has a strictly greater UpdatedAt timestamp, and keeps the existing entry otherwise.
+	ConflictKeepNewer ConflictPolicy = iota
+
+	// ConflictKeepExisting always preserves the existing entry in the destination vault
+	// and skips any imported entry with the same ID.
+	ConflictKeepExisting
+
+	// ConflictOverwrite always replaces the existing entry in the destination vault
+	// with the imported entry (incrementing the entry version monotonically).
+	ConflictOverwrite
+
+	// ConflictKeepBoth preserves the existing entry in the destination vault and imports
+	// the conflicting entry under a newly generated UUIDv4 ID.
+	ConflictKeepBoth
+)
+
+func (p ConflictPolicy) valid() bool {
+	switch p {
+	case ConflictKeepNewer, ConflictKeepExisting, ConflictOverwrite, ConflictKeepBoth:
+		return true
+	default:
+		return false
+	}
+}
+
+// ImportResult summarizes the outcome of a Vault.Import operation.
+type ImportResult struct {
+	Added   int
+	Updated int
+	Skipped int
+}
