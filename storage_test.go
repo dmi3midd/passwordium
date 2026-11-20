@@ -24,8 +24,6 @@ func TestMemoryStorage(t *testing.T) {
 	if err := store.Save(ctx, payload); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-
-	// Mutating caller slice after Save must not affect stored bytes.
 	payload[0] ^= 0xff
 
 	loaded, err := store.Load(ctx)
@@ -36,7 +34,6 @@ func TestMemoryStorage(t *testing.T) {
 		t.Fatalf("Load = %q, want %q", loaded, "encrypted-vault-bytes")
 	}
 
-	// Mutating returned slice must not affect subsequent Load.
 	loaded[0] ^= 0xff
 	loaded2, err := store.Load(ctx)
 	if err != nil {
@@ -46,7 +43,6 @@ func TestMemoryStorage(t *testing.T) {
 		t.Fatal("MemoryStorage leaked mutable internal slice")
 	}
 
-	// Context cancellation.
 	cancelCtx, cancel := context.WithCancel(ctx)
 	cancel()
 	if err := store.Save(cancelCtx, []byte("x")); !errors.Is(err, context.Canceled) {
@@ -56,7 +52,6 @@ func TestMemoryStorage(t *testing.T) {
 		t.Fatalf("canceled Load err = %v, want context.Canceled", err)
 	}
 
-	// Concurrent reads and writes under -race.
 	var wg sync.WaitGroup
 	for i := range 16 {
 		wg.Add(1)
@@ -107,7 +102,6 @@ func TestFileStorage(t *testing.T) {
 		t.Fatalf("Load #1 = %q, want %q", got, first)
 	}
 
-	// Overwrite atomically and check no temp files remain.
 	second := []byte("second-version-bytes-updated")
 	if err := store.Save(ctx, second); err != nil {
 		t.Fatalf("Save #2: %v", err)
@@ -128,7 +122,6 @@ func TestFileStorage(t *testing.T) {
 		t.Fatalf("unexpected files in dir: %+v", entries)
 	}
 
-	// Context cancellation should not write or overwrite.
 	cancelCtx, cancel := context.WithCancel(ctx)
 	cancel()
 	if err := store.Save(cancelCtx, []byte("should-not-write")); !errors.Is(err, context.Canceled) {
@@ -138,4 +131,62 @@ func TestFileStorage(t *testing.T) {
 	if err != nil || !bytes.Equal(got3, second) {
 		t.Fatalf("file mutated on canceled Save: got=%q err=%v", got3, err)
 	}
+}
+
+// FINDING-03: bounded reads and rejection of non-regular files.
+func TestFileStorageLoadHardening(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	t.Run("size_limit", func(t *testing.T) {
+		path := filepath.Join(dir, "big.psdm")
+		if err := os.WriteFile(path, bytes.Repeat([]byte{0xAB}, 1025), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if _, err := NewFileStorage(path, WithMaxFileSize(1024)).Load(ctx); !errors.Is(err, ErrVaultTooLarge) {
+			t.Fatalf("oversized Load err = %v, want ErrVaultTooLarge", err)
+		}
+		data, err := NewFileStorage(path, WithMaxFileSize(1025)).Load(ctx)
+		if err != nil || len(data) != 1025 {
+			t.Fatalf("Load at exact limit: len=%d err=%v", len(data), err)
+		}
+		if _, err := NewFileStorage(path, WithMaxFileSize(0)).Load(ctx); err == nil {
+			t.Fatal("non-positive max size must be rejected")
+		}
+	})
+
+	t.Run("symlink_rejected", func(t *testing.T) {
+		target := filepath.Join(dir, "target.psdm")
+		if err := os.WriteFile(target, []byte("data"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		link := filepath.Join(dir, "link.psdm")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symlinks unsupported: %v", err)
+		}
+		if _, err := NewFileStorage(link).Load(ctx); !errors.Is(err, ErrInvalidStorageFile) {
+			t.Fatalf("symlink Load err = %v, want ErrInvalidStorageFile", err)
+		}
+	})
+
+	t.Run("directory_rejected", func(t *testing.T) {
+		sub := filepath.Join(dir, "subdir")
+		if err := os.Mkdir(sub, 0o700); err != nil {
+			t.Fatalf("Mkdir: %v", err)
+		}
+		if _, err := NewFileStorage(sub).Load(ctx); !errors.Is(err, ErrInvalidStorageFile) {
+			t.Fatalf("directory Load err = %v, want ErrInvalidStorageFile", err)
+		}
+	})
+
+	t.Run("empty_path", func(t *testing.T) {
+		if _, err := NewFileStorage("").Load(ctx); err == nil {
+			t.Fatal("empty path Load must fail")
+		}
+		if err := NewFileStorage("").Save(ctx, []byte("x")); err == nil {
+			t.Fatal("empty path Save must fail")
+		}
+	})
 }

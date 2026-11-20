@@ -5,10 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
 )
+
+// DefaultMaxFileSize is the default maximum vault size accepted by FileStorage.Load (64 MiB).
+const DefaultMaxFileSize int64 = 64 * 1024 * 1024
 
 // Storage defines the persistence backend for serialized encrypted vaults.
 // Implementations must be safe for concurrent use by multiple goroutines.
@@ -17,25 +21,49 @@ type Storage interface {
 	Save(ctx context.Context, data []byte) error
 }
 
+// FileStorageOption configures FileStorage.
+type FileStorageOption func(*FileStorage)
+
+// WithMaxFileSize sets the maximum number of bytes FileStorage.Load will read.
+func WithMaxFileSize(maxBytes int64) FileStorageOption {
+	return func(s *FileStorage) {
+		s.maxSize = maxBytes
+	}
+}
+
 // FileStorage persists the vault to a single file using atomic temporary-file
 // writes and 0600 file permissions.
 type FileStorage struct {
-	mu   sync.RWMutex
-	path string
+	mu      sync.RWMutex
+	path    string
+	maxSize int64
 }
 
-// NewFileStorage creates a FileStorage targeting path.
-func NewFileStorage(path string) *FileStorage {
-	return &FileStorage{path: path}
+// NewFileStorage creates a FileStorage targeting path. By default Load rejects
+// files larger than DefaultMaxFileSize.
+func NewFileStorage(path string, opts ...FileStorageOption) *FileStorage {
+	s := &FileStorage{path: path, maxSize: DefaultMaxFileSize}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	return s
 }
 
-// Load reads the vault file from disk, returning ErrNotFound if it does not exist.
+// Load reads the vault file from disk. It returns ErrNotFound if the file does not
+// exist, ErrInvalidStorageFile if the path is not a regular file (symlinks, FIFOs,
+// devices, and directories are rejected before opening, so Load cannot block on them),
+// and ErrVaultTooLarge if the file exceeds the configured size limit.
 func (s *FileStorage) Load(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if s.path == "" {
 		return nil, errors.New("passwordium: file storage path is empty")
+	}
+	if s.maxSize <= 0 {
+		return nil, errors.New("passwordium: max file size must be positive")
 	}
 
 	s.mu.RLock()
@@ -45,12 +73,44 @@ func (s *FileStorage) Load(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 
-	data, err := os.ReadFile(s.path)
+	linfo, err := os.Lstat(s.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, ErrNotFound
 		}
+		return nil, fmt.Errorf("passwordium: stat vault file: %w", err)
+	}
+	if !linfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: mode %s", ErrInvalidStorageFile, linfo.Mode().Type())
+	}
+	if linfo.Size() > s.maxSize {
+		return nil, fmt.Errorf("%w: %d bytes exceeds limit %d", ErrVaultTooLarge, linfo.Size(), s.maxSize)
+	}
+
+	f, err := os.Open(s.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("passwordium: open vault file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	// Guard against the path being swapped between Lstat and Open.
+	finfo, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("passwordium: fstat vault file: %w", err)
+	}
+	if !finfo.Mode().IsRegular() || !os.SameFile(linfo, finfo) {
+		return nil, fmt.Errorf("%w: file changed during open", ErrInvalidStorageFile)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, s.maxSize+1))
+	if err != nil {
 		return nil, fmt.Errorf("passwordium: read vault file: %w", err)
+	}
+	if int64(len(data)) > s.maxSize {
+		return nil, fmt.Errorf("%w: exceeds limit %d bytes", ErrVaultTooLarge, s.maxSize)
 	}
 	return data, nil
 }

@@ -31,12 +31,14 @@ func (h header) marshal() []byte {
 	binary.BigEndian.PutUint16(buf[4:6], h.Version)
 	copy(buf[6:38], h.Salt[:])
 	binary.BigEndian.PutUint32(buf[38:42], h.Params.Time)
-	binary.BigEndian.PutUint32(buf[42:46], h.Params.Memory)
+	binary.BigEndian.PutUint32(buf[42:46], h.Params.MemoryKiB)
 	binary.BigEndian.PutUint32(buf[46:50], h.Params.Threads)
 	return buf
 }
 
-func parseHeader(data []byte) (header, error) {
+// parseHeader decodes the plaintext header and enforces resource limits on the
+// (not yet authenticated) Argon2id parameters before any key derivation can run.
+func parseHeader(data []byte, limits crypto.Argon2Limits) (header, error) {
 	if len(data) < headerSize {
 		return header{}, fmt.Errorf("%w: expected at least %d bytes, got %d", ErrInvalidHeader, headerSize, len(data))
 	}
@@ -53,11 +55,11 @@ func parseHeader(data []byte) (header, error) {
 	h.Version = version
 	copy(h.Salt[:], data[6:38])
 	h.Params = Argon2Params{
-		Time:    binary.BigEndian.Uint32(data[38:42]),
-		Memory:  binary.BigEndian.Uint32(data[42:46]),
-		Threads: binary.BigEndian.Uint32(data[46:50]),
+		Time:      binary.BigEndian.Uint32(data[38:42]),
+		MemoryKiB: binary.BigEndian.Uint32(data[42:46]),
+		Threads:   binary.BigEndian.Uint32(data[46:50]),
 	}
-	if err := h.Params.validate(); err != nil {
+	if err := h.Params.validateLimits(limits); err != nil {
 		return header{}, err
 	}
 	return h, nil
@@ -71,8 +73,8 @@ func packEnvelope(headerBytes, nonce, ciphertext []byte) []byte {
 	return out
 }
 
-func unpackEnvelope(data []byte) (hdr header, headerBytes, nonce, ciphertext []byte, err error) {
-	hdr, err = parseHeader(data)
+func unpackEnvelope(data []byte, limits crypto.Argon2Limits) (hdr header, headerBytes, nonce, ciphertext []byte, err error) {
+	hdr, err = parseHeader(data, limits)
 	if err != nil {
 		return header{}, nil, nil, nil, err
 	}

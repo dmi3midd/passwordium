@@ -2,6 +2,7 @@ package passwordium
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/dmi3midd/passwordium/internal/crypto"
@@ -9,9 +10,9 @@ import (
 
 // Argon2Params configures the Argon2id key derivation function for a vault.
 type Argon2Params struct {
-	Time    uint32
-	Memory  uint32 // Memory cost in KiB (for example, 64 * 1024 for 64 MiB).
-	Threads uint32
+	Time      uint32
+	MemoryKiB uint32 // Memory cost in KiB (for example, 64 * 1024 for 64 MiB). See Argon2ParamsMiB.
+	Threads   uint32
 }
 
 // DefaultArgon2Params returns the recommended default Argon2id parameters
@@ -19,23 +20,60 @@ type Argon2Params struct {
 func DefaultArgon2Params() Argon2Params {
 	p := crypto.DefaultArgon2Params()
 	return Argon2Params{
-		Time:    p.Time,
-		Memory:  p.Memory,
-		Threads: p.Threads,
+		Time:      p.Time,
+		MemoryKiB: p.MemoryKiB,
+		Threads:   p.Threads,
+	}
+}
+
+// DefaultMaxArgon2Params returns the default upper bounds Open applies to Argon2id
+// parameters read from an untrusted header (Time=16, Memory=512 MiB, Threads=16).
+// Additionally, Open rejects headers whose Time*MemoryKiB exceeds 2 GiB-passes by default.
+func DefaultMaxArgon2Params() Argon2Params {
+	return Argon2Params{
+		Time:      crypto.DefaultMaxArgonTime,
+		MemoryKiB: crypto.DefaultMaxArgonMemoryKiB,
+		Threads:   crypto.DefaultMaxArgonThreads,
+	}
+}
+
+// Argon2ParamsMiB constructs Argon2Params from a memory cost expressed in MiB,
+// avoiding KiB/MiB unit confusion. Values that would overflow saturate to
+// math.MaxUint32 KiB and are subsequently rejected by validation.
+func Argon2ParamsMiB(time, memoryMiB, threads uint32) Argon2Params {
+	memoryKiB := uint32(math.MaxUint32)
+	if memoryMiB <= math.MaxUint32/1024 {
+		memoryKiB = memoryMiB * 1024
+	}
+	return Argon2Params{
+		Time:      time,
+		MemoryKiB: memoryKiB,
+		Threads:   threads,
 	}
 }
 
 func (p Argon2Params) toCrypto() crypto.Argon2Params {
 	return crypto.Argon2Params{
-		Time:    p.Time,
-		Memory:  p.Memory,
-		Threads: p.Threads,
+		Time:      p.Time,
+		MemoryKiB: p.MemoryKiB,
+		Threads:   p.Threads,
 	}
 }
 
-// validate verifies that Argon2Params are within safe cryptographic and resource bounds.
-func (p Argon2Params) validate() error {
-	if err := p.toCrypto().Validate(); err != nil {
+// validateForCreate enforces the 16 MiB memory floor unless allowWeak is set by internal test hooks.
+func (p Argon2Params) validateForCreate(allowWeak bool) error {
+	minMem := crypto.MinCreateArgonMemoryKiB
+	if allowWeak {
+		minMem = crypto.MinArgonMemoryKiB
+	}
+	if err := p.toCrypto().ValidateForCreate(minMem); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgon2Params, err)
+	}
+	return nil
+}
+
+func (p Argon2Params) validateLimits(limits crypto.Argon2Limits) error {
+	if err := p.toCrypto().ValidateLimits(limits); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidArgon2Params, err)
 	}
 	return nil

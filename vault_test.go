@@ -18,12 +18,38 @@ import (
 
 var uuidV4Regex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
-func fastTestArgon2() Option {
-	return WithArgon2Params(Argon2Params{
-		Time:    1,
-		Memory:  64,
-		Threads: 1,
+// fastTestArgon2 uses the unexported weak-params hook so unit tests stay fast;
+// public callers cannot go below the 16 MiB Create floor.
+func fastTestArgon2() CreateOption {
+	return withUnsafeArgon2Params(Argon2Params{
+		Time:      1,
+		MemoryKiB: 64,
+		Threads:   1,
 	})
+}
+
+// testIndexKey re-derives indexKey from the stored header so tests can craft
+// validly authenticated outer envelopes (the Vault itself no longer retains raw keys).
+func testIndexKey(t *testing.T, store Storage, pass []byte) []byte {
+	t.Helper()
+	raw, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("testIndexKey Load: %v", err)
+	}
+	hdr, err := parseHeader(raw, crypto.DefaultArgon2Limits())
+	if err != nil {
+		t.Fatalf("testIndexKey parseHeader: %v", err)
+	}
+	mk, err := crypto.DeriveMasterKey(pass, hdr.Salt[:], hdr.Params.toCrypto())
+	if err != nil {
+		t.Fatalf("testIndexKey DeriveMasterKey: %v", err)
+	}
+	defer crypto.ZeroBytes(mk)
+	ik, err := crypto.DeriveSubKey(mk, hkdfContextIndex)
+	if err != nil {
+		t.Fatalf("testIndexKey DeriveSubKey: %v", err)
+	}
+	return ik
 }
 
 func TestVaultLifecycleMemoryAndFile(t *testing.T) {
@@ -329,7 +355,7 @@ func TestVaultCreateAndOpenValidation(t *testing.T) {
 	if _, err := Create(ctx, store, nil); !errors.Is(err, ErrEmptyPassword) {
 		t.Fatalf("Create empty password err = %v, want ErrEmptyPassword", err)
 	}
-	if _, err := Create(ctx, store, []byte("pass"), WithArgon2Params(Argon2Params{Time: 0, Memory: 64, Threads: 1})); !errors.Is(err, ErrInvalidArgon2Params) {
+	if _, err := Create(ctx, store, []byte("pass"), WithArgon2Params(Argon2Params{Time: 0, MemoryKiB: 64, Threads: 1})); !errors.Is(err, ErrInvalidArgon2Params) {
 		t.Fatalf("Create invalid Argon2 err = %v, want ErrInvalidArgon2Params", err)
 	}
 	if _, err := Open(ctx, store, []byte("pass")); !errors.Is(err, ErrNotFound) {
@@ -393,7 +419,7 @@ func TestVaultHeaderTamperingAAD(t *testing.T) {
 	}
 
 	// Capture indexKey before closing so we can verify AAD binding independently of KDF.
-	indexKeyCopy := bytes.Clone(v.indexKey)
+	indexKeyCopy := testIndexKey(t, store, pass)
 	_ = v.Close()
 
 	origRaw, err := store.Load(ctx)
@@ -402,7 +428,7 @@ func TestVaultHeaderTamperingAAD(t *testing.T) {
 	}
 
 	// 1. Direct cryptographic AAD check across every single byte of the 50-byte header.
-	_, hdrBytes, nonce, ciphertext, err := unpackEnvelope(origRaw)
+	_, hdrBytes, nonce, ciphertext, err := unpackEnvelope(origRaw, crypto.DefaultArgon2Limits())
 	if err != nil {
 		t.Fatalf("unpackEnvelope: %v", err)
 	}
@@ -507,7 +533,7 @@ func TestVaultEntrySecretSwapAndVersionRollback(t *testing.T) {
 	}
 
 	// Capture indexKey before closing to craft a valid outer envelope with swapped entry secrets.
-	indexKeyCopy := bytes.Clone(v.indexKey)
+	indexKeyCopy := testIndexKey(t, store, pass)
 
 	// 1. In-memory version rollback check (v1 secret placed under v2 entry metadata).
 	v1Nonce := bytes.Clone(v.entries[idA].secretNonce)
@@ -531,7 +557,7 @@ func TestVaultEntrySecretSwapAndVersionRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	_, hdrBytes, nonce, ciphertext, err := unpackEnvelope(raw)
+	_, hdrBytes, nonce, ciphertext, err := unpackEnvelope(raw, crypto.DefaultArgon2Limits())
 	if err != nil {
 		t.Fatalf("unpackEnvelope: %v", err)
 	}
@@ -684,9 +710,8 @@ func TestVaultCloseZeroesKeys(t *testing.T) {
 	}
 
 	// Hold references to underlying slices before Close() to verify clear().
-	mk := v.masterKey
-	ik := v.indexKey
-	sk := v.secretKey
+	ic := v.indexCipher
+	sc := v.secretCipher
 	rec := v.entries[id]
 	sn := rec.secretNonce
 	es := rec.encryptedSecret
@@ -700,8 +725,11 @@ func TestVaultCloseZeroesKeys(t *testing.T) {
 		return true
 	}
 
-	if allZero(mk) || allZero(ik) || allZero(sk) || allZero(sn) || allZero(es) {
-		t.Fatal("keys or encrypted secret unexpectedly all-zero before Close")
+	if ic == nil || sc == nil {
+		t.Fatal("session ciphers unexpectedly nil before Close")
+	}
+	if allZero(sn) || allZero(es) {
+		t.Fatal("encrypted secret unexpectedly all-zero before Close")
 	}
 
 	if err := v.Close(); err != nil {
@@ -712,9 +740,6 @@ func TestVaultCloseZeroesKeys(t *testing.T) {
 	}
 
 	for name, b := range map[string][]byte{
-		"masterKey":       mk,
-		"indexKey":        ik,
-		"secretKey":       sk,
 		"secretNonce":     sn,
 		"encryptedSecret": es,
 	} {
@@ -723,8 +748,15 @@ func TestVaultCloseZeroesKeys(t *testing.T) {
 		}
 	}
 
-	if v.masterKey != nil || v.indexKey != nil || v.secretKey != nil || v.entries != nil {
+	if v.indexCipher != nil || v.secretCipher != nil || v.entries != nil {
 		t.Fatal("Vault fields were not cleared on Close")
+	}
+	// Retained references to the old ciphers must be unusable after Close.
+	if _, _, err := ic.Encrypt([]byte("x"), nil); !errors.Is(err, crypto.ErrCipherClosed) {
+		t.Fatalf("indexCipher after Close err = %v, want ErrCipherClosed", err)
+	}
+	if _, _, err := sc.Encrypt([]byte("x"), nil); !errors.Is(err, crypto.ErrCipherClosed) {
+		t.Fatalf("secretCipher after Close err = %v, want ErrCipherClosed", err)
 	}
 	if _, err := v.Put(ctx, EntryMeta{Title: "X"}, Secret{}); !errors.Is(err, ErrVaultClosed) {
 		t.Fatalf("Put after Close err = %v, want ErrVaultClosed", err)

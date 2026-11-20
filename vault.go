@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -26,19 +27,21 @@ const (
 // Vault is a thread-safe encrypted credential store backed by a Storage implementation.
 // Entry metadata is kept indexed in memory after Open for fast search, while each
 // entry's SecretPayload remains encrypted in memory until GetSecret is called.
+//
+// The master key and raw subkeys are wiped immediately after key derivation; only
+// the initialized AEAD instances for indexKey and secretKey are retained for the session.
 type Vault struct {
-	mu        sync.RWMutex
-	store     Storage
-	hdr       header
-	masterKey []byte
-	indexKey  []byte
-	secretKey []byte
-	entries   map[string]*entryRecord
-	version   uint64
-	updatedAt int64
-	dirty     bool
-	autoSave  bool
-	closed    bool
+	mu           sync.RWMutex
+	store        Storage
+	hdr          header
+	indexCipher  *crypto.Cipher
+	secretCipher *crypto.Cipher
+	entries      map[string]*entryRecord
+	version      uint64
+	updatedAt    int64
+	dirty        bool
+	autoSave     bool
+	closed       bool
 }
 
 // entryRecord is a pure-Go in-memory representation of a vault entry, avoiding
@@ -93,26 +96,45 @@ func entryAAD(id string, version uint64) []byte {
 	return []byte(fmt.Sprintf("%s:%d", id, version))
 }
 
-func deriveVaultKeys(masterPassword, salt []byte, params Argon2Params) (masterKey, indexKey, secretKey []byte, err error) {
-	masterKey = crypto.DeriveMasterKey(masterPassword, salt, params.toCrypto())
-	indexKey, err = crypto.DeriveSubKey(masterKey, hkdfContextIndex)
+// deriveVaultCiphers runs Argon2id + HKDF-SHA256, initializes one AEAD per subkey,
+// and wipes masterKey, indexKey, and secretKey before returning on every path.
+func deriveVaultCiphers(masterPassword, salt []byte, params Argon2Params) (indexCipher, secretCipher *crypto.Cipher, err error) {
+	masterKey, err := crypto.DeriveMasterKey(masterPassword, salt, params.toCrypto())
 	if err != nil {
-		crypto.ZeroBytes(masterKey)
-		return nil, nil, nil, err
+		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidArgon2Params, err)
 	}
-	secretKey, err = crypto.DeriveSubKey(masterKey, hkdfContextSecret)
+	defer crypto.ZeroBytes(masterKey)
+
+	indexKey, err := crypto.DeriveSubKey(masterKey, hkdfContextIndex)
 	if err != nil {
-		crypto.ZeroBytes(indexKey)
-		crypto.ZeroBytes(masterKey)
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
-	return masterKey, indexKey, secretKey, nil
+	defer crypto.ZeroBytes(indexKey)
+
+	secretKey, err := crypto.DeriveSubKey(masterKey, hkdfContextSecret)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer crypto.ZeroBytes(secretKey)
+
+	indexCipher, err = crypto.NewCipher(indexKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	secretCipher, err = crypto.NewCipher(secretKey)
+	if err != nil {
+		indexCipher.Close()
+		return nil, nil, err
+	}
+	return indexCipher, secretCipher, nil
 }
 
 // Create initializes a brand-new encrypted vault with a fresh random salt,
 // derives keys from masterPassword using Argon2id + HKDF-SHA256, and immediately
-// saves the empty vault to store.
-func Create(ctx context.Context, store Storage, masterPassword []byte, opts ...Option) (*Vault, error) {
+// saves the empty vault to store. Create refuses to replace an existing vault
+// (returning ErrAlreadyExists) unless WithOverwrite(true) is supplied, and rejects
+// Argon2id memory costs below 16 MiB.
+func Create(ctx context.Context, store Storage, masterPassword []byte, opts ...CreateOption) (*Vault, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -123,14 +145,24 @@ func Create(ctx context.Context, store Storage, masterPassword []byte, opts ...O
 		return nil, ErrEmptyPassword
 	}
 
-	cfg := defaultVaultConfig()
+	cfg := defaultCreateConfig()
 	for _, opt := range opts {
 		if opt != nil {
-			opt(&cfg)
+			opt.applyCreate(&cfg)
 		}
 	}
-	if err := cfg.argon2Params.validate(); err != nil {
+	if err := cfg.argon2Params.validateForCreate(cfg.allowWeakArgon2); err != nil {
 		return nil, err
+	}
+
+	if !cfg.overwrite {
+		_, err := store.Load(ctx)
+		switch {
+		case err == nil:
+			return nil, ErrAlreadyExists
+		case !errors.Is(err, ErrNotFound):
+			return nil, err
+		}
 	}
 
 	salt, err := crypto.RandomBytes(crypto.SaltSize)
@@ -143,20 +175,19 @@ func Create(ctx context.Context, store Storage, masterPassword []byte, opts ...O
 	copy(hdr.Salt[:], salt)
 	hdr.Params = cfg.argon2Params
 
-	masterKey, indexKey, secretKey, err := deriveVaultKeys(masterPassword, hdr.Salt[:], hdr.Params)
+	indexCipher, secretCipher, err := deriveVaultCiphers(masterPassword, hdr.Salt[:], hdr.Params)
 	if err != nil {
 		return nil, err
 	}
 
 	v := &Vault{
-		store:     store,
-		hdr:       hdr,
-		masterKey: masterKey,
-		indexKey:  indexKey,
-		secretKey: secretKey,
-		entries:   make(map[string]*entryRecord),
-		updatedAt: time.Now().UTC().Unix(),
-		autoSave:  cfg.autoSave,
+		store:        store,
+		hdr:          hdr,
+		indexCipher:  indexCipher,
+		secretCipher: secretCipher,
+		entries:      make(map[string]*entryRecord),
+		updatedAt:    time.Now().UTC().Unix(),
+		autoSave:     cfg.autoSave,
 	}
 
 	if err := v.Save(ctx); err != nil {
@@ -166,10 +197,12 @@ func Create(ctx context.Context, store Storage, masterPassword []byte, opts ...O
 	return v, nil
 }
 
-// Open loads an existing vault from store, verifies the binary header and AAD,
-// derives keys from masterPassword, and decrypts the VaultData container index.
-// Individual entry secrets remain encrypted in memory until GetSecret is called.
-func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...Option) (*Vault, error) {
+// Open loads an existing vault from store, enforces resource limits on the
+// plaintext header's Argon2id parameters (DefaultMaxArgon2Params, or the bounds
+// given via WithMaxArgon2Params) before running any key derivation, derives keys
+// from masterPassword, and decrypts the VaultData container index with the header
+// as AAD. Individual entry secrets remain encrypted in memory until GetSecret is called.
+func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...OpenOption) (*Vault, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -177,10 +210,24 @@ func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...Opt
 		return nil, ErrNilStorage
 	}
 
-	cfg := defaultVaultConfig()
+	var cfg openConfig
 	for _, opt := range opts {
 		if opt != nil {
-			opt(&cfg)
+			opt.applyOpen(&cfg)
+		}
+	}
+
+	limits := crypto.DefaultArgon2Limits()
+	if cfg.hasMaxArgon2 {
+		max := cfg.maxArgon2Params
+		if err := max.toCrypto().Validate(); err != nil {
+			return nil, fmt.Errorf("%w: invalid max limits: %v", ErrInvalidArgon2Params, err)
+		}
+		limits = crypto.Argon2Limits{
+			MaxTime:      max.Time,
+			MaxMemoryKiB: max.MemoryKiB,
+			MaxThreads:   max.Threads,
+			MaxWork:      uint64(max.Time) * uint64(max.MemoryKiB),
 		}
 	}
 
@@ -189,46 +236,46 @@ func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...Opt
 		return nil, err
 	}
 
-	hdr, headerBytes, nonce, ciphertext, err := unpackEnvelope(raw)
+	hdr, headerBytes, nonce, ciphertext, err := unpackEnvelope(raw, limits)
 	if err != nil {
 		return nil, err
 	}
 
-	masterKey, indexKey, secretKey, err := deriveVaultKeys(masterPassword, hdr.Salt[:], hdr.Params)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	plaintext, err := crypto.Decrypt(indexKey, nonce, ciphertext, headerBytes)
+	indexCipher, secretCipher, err := deriveVaultCiphers(masterPassword, hdr.Salt[:], hdr.Params)
 	if err != nil {
-		crypto.ZeroBytes(secretKey)
-		crypto.ZeroBytes(indexKey)
-		crypto.ZeroBytes(masterKey)
+		return nil, err
+	}
+	closeCiphers := func() {
+		indexCipher.Close()
+		secretCipher.Close()
+	}
+
+	plaintext, err := indexCipher.Decrypt(nonce, ciphertext, headerBytes)
+	if err != nil {
+		closeCiphers()
 		return nil, ErrInvalidPassword
 	}
 	defer crypto.ZeroBytes(plaintext)
 
 	var pb vaultpb.VaultData
 	if err := proto.Unmarshal(plaintext, &pb); err != nil {
-		crypto.ZeroBytes(secretKey)
-		crypto.ZeroBytes(indexKey)
-		crypto.ZeroBytes(masterKey)
+		closeCiphers()
 		return nil, fmt.Errorf("%w: %w", ErrCorruptedVault, err)
 	}
 
 	entries := make(map[string]*entryRecord, len(pb.Entries))
 	for _, e := range pb.Entries {
 		if e == nil || e.Id == "" {
-			crypto.ZeroBytes(secretKey)
-			crypto.ZeroBytes(indexKey)
-			crypto.ZeroBytes(masterKey)
+			closeCiphers()
 			return nil, fmt.Errorf("%w: entry missing id", ErrCorruptedVault)
 		}
 		if _, dup := entries[e.Id]; dup {
-			crypto.ZeroBytes(secretKey)
-			crypto.ZeroBytes(indexKey)
-			crypto.ZeroBytes(masterKey)
-			return nil, fmt.Errorf("%w: duplicate entry id %q", ErrCorruptedVault, e.Id)
+			closeCiphers()
+			return nil, fmt.Errorf("%w: duplicate entry id", ErrCorruptedVault)
 		}
 		entries[e.Id] = &entryRecord{
 			id:              e.Id,
@@ -245,15 +292,14 @@ func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...Opt
 	}
 
 	return &Vault{
-		store:     store,
-		hdr:       hdr,
-		masterKey: masterKey,
-		indexKey:  indexKey,
-		secretKey: secretKey,
-		entries:   entries,
-		version:   pb.Version,
-		updatedAt: pb.UpdatedAt,
-		autoSave:  cfg.autoSave,
+		store:        store,
+		hdr:          hdr,
+		indexCipher:  indexCipher,
+		secretCipher: secretCipher,
+		entries:      entries,
+		version:      pb.Version,
+		updatedAt:    pb.UpdatedAt,
+		autoSave:     cfg.autoSave,
 	}, nil
 }
 
@@ -294,18 +340,18 @@ func (v *Vault) Put(ctx context.Context, meta EntryMeta, secret Secret) (string,
 		createdAt = existing.createdAt
 	}
 
-	pbSecret := &vaultpb.SecretPayload{
+	// proto.Marshal does not retain or mutate CustomFields, so no defensive copy is needed.
+	plainSecret, err := proto.Marshal(&vaultpb.SecretPayload{
 		Password:     secret.Password,
 		Notes:        secret.Notes,
-		CustomFields: maps.Clone(secret.CustomFields),
-	}
-	plainSecret, err := proto.Marshal(pbSecret)
+		CustomFields: secret.CustomFields,
+	})
 	if err != nil {
 		return "", fmt.Errorf("passwordium: marshal secret: %w", err)
 	}
 	defer crypto.ZeroBytes(plainSecret)
 
-	secretNonce, encryptedSecret, err := crypto.Encrypt(v.secretKey, plainSecret, entryAAD(id, version))
+	secretNonce, encryptedSecret, err := v.secretCipher.Encrypt(plainSecret, entryAAD(id, version))
 	if err != nil {
 		return "", fmt.Errorf("passwordium: encrypt secret: %w", err)
 	}
@@ -363,7 +409,8 @@ func (v *Vault) GetMeta(id string) (EntryMeta, error) {
 	return rec.toMeta(), nil
 }
 
-// GetSecret decrypts and returns the Secret for entry id.
+// GetSecret decrypts and returns the Secret for entry id. The returned
+// CustomFields map is freshly allocated and owned by the caller.
 func (v *Vault) GetSecret(id string) (Secret, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -377,7 +424,7 @@ func (v *Vault) GetSecret(id string) (Secret, error) {
 		return Secret{}, ErrEntryNotFound
 	}
 
-	plain, err := crypto.Decrypt(v.secretKey, rec.secretNonce, rec.encryptedSecret, entryAAD(rec.id, rec.version))
+	plain, err := v.secretCipher.Decrypt(rec.secretNonce, rec.encryptedSecret, entryAAD(rec.id, rec.version))
 	if err != nil {
 		return Secret{}, fmt.Errorf("%w: %w", ErrSecretCorrupted, err)
 	}
@@ -388,20 +435,37 @@ func (v *Vault) GetSecret(id string) (Secret, error) {
 		return Secret{}, fmt.Errorf("%w: %w", ErrSecretCorrupted, err)
 	}
 
+	// pb is local and its map was freshly allocated by proto.Unmarshal; no copy needed.
 	return Secret{
 		Password:     pb.Password,
 		Notes:        pb.Notes,
-		CustomFields: maps.Clone(pb.CustomFields),
+		CustomFields: pb.CustomFields,
 	}, nil
 }
 
-// Delete removes entry id from the vault.
+// Delete removes entry id from the vault. It is equivalent to
+// DeleteContext(context.Background(), id); prefer DeleteContext when
+// WithAutoSave is enabled and Storage may block.
 func (v *Vault) Delete(id string) error {
+	return v.DeleteContext(context.Background(), id)
+}
+
+// DeleteContext removes entry id from the vault. When WithAutoSave is enabled,
+// ctx is propagated to Storage.Save so deadlines and cancellation are honored;
+// on save failure the deletion is rolled back.
+func (v *Vault) DeleteContext(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
 	if v.closed {
 		return ErrVaultClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	rec, ok := v.entries[id]
@@ -414,7 +478,7 @@ func (v *Vault) Delete(id string) error {
 	v.dirty = true
 
 	if v.autoSave {
-		if err := v.saveLocked(context.Background()); err != nil {
+		if err := v.saveLocked(ctx); err != nil {
 			v.entries[id] = rec
 			v.dirty = prevDirty
 			return err
@@ -516,26 +580,23 @@ func (v *Vault) saveLocked(ctx context.Context) error {
 		pbEntries = append(pbEntries, v.entries[id].toProto())
 	}
 
-	pbVault := &vaultpb.VaultData{
+	plaintext, err := proto.Marshal(&vaultpb.VaultData{
 		Version:   nextVersion,
 		UpdatedAt: now,
 		Entries:   pbEntries,
-	}
-
-	plaintext, err := proto.Marshal(pbVault)
+	})
 	if err != nil {
 		return fmt.Errorf("passwordium: marshal vault: %w", err)
 	}
 	defer crypto.ZeroBytes(plaintext)
 
 	headerBytes := v.hdr.marshal()
-	nonce, ciphertext, err := crypto.Encrypt(v.indexKey, plaintext, headerBytes)
+	nonce, ciphertext, err := v.indexCipher.Encrypt(plaintext, headerBytes)
 	if err != nil {
 		return fmt.Errorf("passwordium: encrypt vault: %w", err)
 	}
 
-	envelope := packEnvelope(headerBytes, nonce, ciphertext)
-	if err := v.store.Save(ctx, envelope); err != nil {
+	if err := v.store.Save(ctx, packEnvelope(headerBytes, nonce, ciphertext)); err != nil {
 		return err
 	}
 
@@ -545,9 +606,9 @@ func (v *Vault) saveLocked(ctx context.Context) error {
 	return nil
 }
 
-// Close zeroes all derived cryptographic keys and encrypted secrets in memory,
-// clears the in-memory entry map, and prevents further operations on the Vault.
-// Calling Close multiple times is safe and idempotent.
+// Close releases the session AEAD instances, zeroes all encrypted entry secrets
+// in memory, clears the in-memory entry map, and prevents further operations on
+// the Vault. Calling Close multiple times is safe and idempotent.
 func (v *Vault) Close() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -556,12 +617,10 @@ func (v *Vault) Close() error {
 		return nil
 	}
 
-	crypto.ZeroBytes(v.masterKey)
-	crypto.ZeroBytes(v.indexKey)
-	crypto.ZeroBytes(v.secretKey)
-	v.masterKey = nil
-	v.indexKey = nil
-	v.secretKey = nil
+	v.indexCipher.Close()
+	v.secretCipher.Close()
+	v.indexCipher = nil
+	v.secretCipher = nil
 
 	for _, rec := range v.entries {
 		rec.zeroSecret()

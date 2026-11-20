@@ -6,6 +6,10 @@ import (
 	"testing"
 )
 
+func fastParams() Argon2Params {
+	return Argon2Params{Time: 1, MemoryKiB: 64, Threads: 1}
+}
+
 func TestDeriveMasterKeyAndSubKey(t *testing.T) {
 	t.Parallel()
 
@@ -13,11 +17,20 @@ func TestDeriveMasterKeyAndSubKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RandomBytes: %v", err)
 	}
-	params := Argon2Params{Time: 1, Memory: 64, Threads: 1}
+	params := fastParams()
 
-	k1 := DeriveMasterKey([]byte("correct-horse-battery-staple"), salt, params)
-	k2 := DeriveMasterKey([]byte("correct-horse-battery-staple"), salt, params)
-	kWrong := DeriveMasterKey([]byte("wrong-password"), salt, params)
+	mustDerive := func(pw, s []byte) []byte {
+		t.Helper()
+		k, err := DeriveMasterKey(pw, s, params)
+		if err != nil {
+			t.Fatalf("DeriveMasterKey: %v", err)
+		}
+		return k
+	}
+
+	k1 := mustDerive([]byte("correct-horse-battery-staple"), salt)
+	k2 := mustDerive([]byte("correct-horse-battery-staple"), salt)
+	kWrong := mustDerive([]byte("wrong-password"), salt)
 
 	if len(k1) != KeySize {
 		t.Fatalf("len(masterKey) = %d, want %d", len(k1), KeySize)
@@ -31,8 +44,7 @@ func TestDeriveMasterKeyAndSubKey(t *testing.T) {
 
 	salt2 := bytes.Clone(salt)
 	salt2[0] ^= 0xff
-	kDiffSalt := DeriveMasterKey([]byte("correct-horse-battery-staple"), salt2, params)
-	if bytes.Equal(k1, kDiffSalt) {
+	if bytes.Equal(k1, mustDerive([]byte("correct-horse-battery-staple"), salt2)) {
 		t.Fatal("different salts produced identical master keys")
 	}
 
@@ -64,6 +76,35 @@ func TestDeriveMasterKeyAndSubKey(t *testing.T) {
 	}
 	if _, err := DeriveSubKey(k1, ""); !errors.Is(err, ErrEmptyContextInfo) {
 		t.Fatalf("empty context err = %v, want ErrEmptyContextInfo", err)
+	}
+}
+
+// FINDING-10: DeriveMasterKey must return an error instead of panicking or truncating Threads.
+func TestDeriveMasterKeyRejectsInvalidParamsWithoutPanic(t *testing.T) {
+	t.Parallel()
+
+	salt := make([]byte, SaltSize)
+	cases := []Argon2Params{
+		{Time: 0, MemoryKiB: 64, Threads: 1},
+		{Time: 1, MemoryKiB: 64, Threads: 0},
+		{Time: 1, MemoryKiB: 64, Threads: 256}, // uint8(256) == 0 would panic in argon2.IDKey
+		{Time: 1, MemoryKiB: 0, Threads: 1},
+	}
+	for _, p := range cases {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("DeriveMasterKey(%+v) panicked: %v", p, r)
+				}
+			}()
+			key, err := DeriveMasterKey([]byte("pw"), salt, p)
+			if !errors.Is(err, ErrInvalidArgon2Params) {
+				t.Fatalf("DeriveMasterKey(%+v) err = %v, want ErrInvalidArgon2Params", p, err)
+			}
+			if key != nil {
+				t.Fatalf("DeriveMasterKey(%+v) returned non-nil key on error", p)
+			}
+		}()
 	}
 }
 
@@ -104,7 +145,6 @@ func TestEncryptDecryptAndTampering(t *testing.T) {
 		t.Fatalf("Decrypt = %q, want %q", got, plaintext)
 	}
 
-	// Empty plaintext must still authenticate and round-trip.
 	emptyNonce, emptyCT, err := Encrypt(key, nil, aad)
 	if err != nil {
 		t.Fatalf("Encrypt empty: %v", err)
@@ -117,33 +157,28 @@ func TestEncryptDecryptAndTampering(t *testing.T) {
 		t.Fatalf("expected empty plaintext, got %d bytes", len(emptyPT))
 	}
 
-	// Tampered AAD.
 	if _, err := Decrypt(key, nonce1, ct1, []byte("entry-123:2")); !errors.Is(err, ErrDecryptionFailed) {
 		t.Fatalf("tampered AAD err = %v, want ErrDecryptionFailed", err)
 	}
 
-	// Tampered ciphertext.
 	badCT := bytes.Clone(ct1)
 	badCT[0] ^= 0x01
 	if _, err := Decrypt(key, nonce1, badCT, aad); !errors.Is(err, ErrDecryptionFailed) {
 		t.Fatalf("tampered ciphertext err = %v, want ErrDecryptionFailed", err)
 	}
 
-	// Tampered nonce.
 	badNonce := bytes.Clone(nonce1)
 	badNonce[len(badNonce)-1] ^= 0x80
 	if _, err := Decrypt(key, badNonce, ct1, aad); !errors.Is(err, ErrDecryptionFailed) {
 		t.Fatalf("tampered nonce err = %v, want ErrDecryptionFailed", err)
 	}
 
-	// Wrong key.
 	wrongKey := bytes.Clone(key)
 	wrongKey[0] ^= 0x01
 	if _, err := Decrypt(wrongKey, nonce1, ct1, aad); !errors.Is(err, ErrDecryptionFailed) {
 		t.Fatalf("wrong key err = %v, want ErrDecryptionFailed", err)
 	}
 
-	// Invalid sizes must return sentinel errors rather than panic.
 	if _, _, err := Encrypt([]byte("short"), plaintext, aad); !errors.Is(err, ErrInvalidKeySize) {
 		t.Fatalf("Encrypt short key err = %v, want ErrInvalidKeySize", err)
 	}
@@ -158,6 +193,62 @@ func TestEncryptDecryptAndTampering(t *testing.T) {
 	}
 }
 
+// FINDING-05: a single reusable Cipher must interoperate with the standalone helpers
+// and stop working after Close.
+func TestCipherReuseAndClose(t *testing.T) {
+	t.Parallel()
+
+	key, err := RandomBytes(KeySize)
+	if err != nil {
+		t.Fatalf("RandomBytes: %v", err)
+	}
+	c, err := NewCipher(key)
+	if err != nil {
+		t.Fatalf("NewCipher: %v", err)
+	}
+	// Zero the caller's key: the Cipher must keep working from its own internal copy.
+	keyCopy := bytes.Clone(key)
+	ZeroBytes(key)
+
+	for i := range 5 {
+		aad := []byte{byte(i)}
+		nonce, ct, err := c.Encrypt([]byte("payload"), aad)
+		if err != nil {
+			t.Fatalf("Cipher.Encrypt #%d: %v", i, err)
+		}
+		pt, err := c.Decrypt(nonce, ct, aad)
+		if err != nil || string(pt) != "payload" {
+			t.Fatalf("Cipher.Decrypt #%d = %q, %v", i, pt, err)
+		}
+		pt2, err := Decrypt(keyCopy, nonce, ct, aad)
+		if err != nil || string(pt2) != "payload" {
+			t.Fatalf("standalone Decrypt of Cipher output #%d = %q, %v", i, pt2, err)
+		}
+	}
+
+	if _, err := NewCipher([]byte("short")); !errors.Is(err, ErrInvalidKeySize) {
+		t.Fatalf("NewCipher short key err = %v, want ErrInvalidKeySize", err)
+	}
+	if _, err := c.Decrypt([]byte("short"), make([]byte, Overhead), nil); !errors.Is(err, ErrInvalidNonceSize) {
+		t.Fatalf("Cipher.Decrypt short nonce err = %v, want ErrInvalidNonceSize", err)
+	}
+
+	c.Close()
+	c.Close() // idempotent
+	if _, _, err := c.Encrypt([]byte("x"), nil); !errors.Is(err, ErrCipherClosed) {
+		t.Fatalf("Encrypt after Close err = %v, want ErrCipherClosed", err)
+	}
+	if _, err := c.Decrypt(make([]byte, NonceSize), make([]byte, Overhead), nil); !errors.Is(err, ErrCipherClosed) {
+		t.Fatalf("Decrypt after Close err = %v, want ErrCipherClosed", err)
+	}
+
+	var nilCipher *Cipher
+	nilCipher.Close()
+	if _, _, err := nilCipher.Encrypt(nil, nil); !errors.Is(err, ErrCipherClosed) {
+		t.Fatalf("nil Cipher Encrypt err = %v, want ErrCipherClosed", err)
+	}
+}
+
 func TestZeroBytes(t *testing.T) {
 	t.Parallel()
 
@@ -168,7 +259,7 @@ func TestZeroBytes(t *testing.T) {
 			t.Fatalf("buf[%d] = %d, want 0", i, b)
 		}
 	}
-	ZeroBytes(nil) // should not panic
+	ZeroBytes(nil)
 }
 
 func TestArgon2ParamsValidate(t *testing.T) {
@@ -177,18 +268,77 @@ func TestArgon2ParamsValidate(t *testing.T) {
 	if err := DefaultArgon2Params().Validate(); err != nil {
 		t.Fatalf("DefaultArgon2Params().Validate() = %v", err)
 	}
+	if err := DefaultArgon2Params().ValidateLimits(DefaultArgon2Limits()); err != nil {
+		t.Fatalf("defaults must satisfy default open limits: %v", err)
+	}
+	if err := DefaultArgon2Params().ValidateForCreate(MinCreateArgonMemoryKiB); err != nil {
+		t.Fatalf("defaults must satisfy create floor: %v", err)
+	}
 
 	invalid := []Argon2Params{
-		{Time: 0, Memory: 64, Threads: 1},
-		{Time: MaxArgonTime + 1, Memory: 64, Threads: 1},
-		{Time: 1, Memory: MinArgonMemory - 1, Threads: 1},
-		{Time: 1, Memory: MaxArgonMemory + 1, Threads: 1},
-		{Time: 1, Memory: 64, Threads: 0},
-		{Time: 1, Memory: 64, Threads: MaxArgonThreads + 1},
+		{Time: 0, MemoryKiB: 64, Threads: 1},
+		{Time: HardMaxArgonTime + 1, MemoryKiB: 64, Threads: 1},
+		{Time: 1, MemoryKiB: MinArgonMemoryKiB - 1, Threads: 1},
+		{Time: 1, MemoryKiB: HardMaxArgonMemoryKiB + 1, Threads: 1},
+		{Time: 1, MemoryKiB: 64, Threads: 0},
+		{Time: 1, MemoryKiB: 64, Threads: HardMaxArgonThreads + 1},
 	}
 	for _, p := range invalid {
 		if err := p.Validate(); !errors.Is(err, ErrInvalidArgon2Params) {
 			t.Errorf("Validate(%+v) = %v, want ErrInvalidArgon2Params", p, err)
 		}
+	}
+}
+
+// FINDING-01: open-time limits, including the combined Time*Memory work bound.
+func TestArgon2ParamsValidateLimits(t *testing.T) {
+	t.Parallel()
+
+	limits := DefaultArgon2Limits()
+	rejected := []Argon2Params{
+		{Time: HardMaxArgonTime, MemoryKiB: HardMaxArgonMemoryKiB, Threads: HardMaxArgonThreads},
+		{Time: DefaultMaxArgonTime + 1, MemoryKiB: 64, Threads: 1},
+		{Time: 1, MemoryKiB: DefaultMaxArgonMemoryKiB + 1, Threads: 1},
+		{Time: 1, MemoryKiB: 64, Threads: DefaultMaxArgonThreads + 1},
+		{Time: DefaultMaxArgonTime, MemoryKiB: DefaultMaxArgonMemoryKiB, Threads: 1}, // 16 * 512 MiB > work limit
+	}
+	for _, p := range rejected {
+		if err := p.ValidateLimits(limits); !errors.Is(err, ErrInvalidArgon2Params) {
+			t.Errorf("ValidateLimits(%+v) = %v, want ErrInvalidArgon2Params", p, err)
+		}
+	}
+
+	accepted := []Argon2Params{
+		{Time: 4, MemoryKiB: DefaultMaxArgonMemoryKiB, Threads: 4}, // exactly at work limit
+		{Time: DefaultMaxArgonTime, MemoryKiB: 128 * 1024, Threads: DefaultMaxArgonThreads},
+		fastParams(),
+	}
+	for _, p := range accepted {
+		if err := p.ValidateLimits(limits); err != nil {
+			t.Errorf("ValidateLimits(%+v) = %v, want nil", p, err)
+		}
+	}
+
+	noWork := limits
+	noWork.MaxWork = 0
+	if err := (Argon2Params{Time: DefaultMaxArgonTime, MemoryKiB: DefaultMaxArgonMemoryKiB, Threads: 1}).ValidateLimits(noWork); err != nil {
+		t.Errorf("MaxWork=0 must disable the product check: %v", err)
+	}
+}
+
+// FINDING-02: creation floor rejects KiB/MiB unit mistakes.
+func TestArgon2ParamsValidateForCreate(t *testing.T) {
+	t.Parallel()
+
+	weak := Argon2Params{Time: 3, MemoryKiB: 64, Threads: 2} // "64" meant as MiB
+	if err := weak.ValidateForCreate(MinCreateArgonMemoryKiB); !errors.Is(err, ErrInvalidArgon2Params) {
+		t.Fatalf("ValidateForCreate(weak) = %v, want ErrInvalidArgon2Params", err)
+	}
+	if err := weak.ValidateForCreate(MinArgonMemoryKiB); err != nil {
+		t.Fatalf("ValidateForCreate(weak, low floor) = %v, want nil", err)
+	}
+	floor := Argon2Params{Time: 1, MemoryKiB: MinCreateArgonMemoryKiB, Threads: 1}
+	if err := floor.ValidateForCreate(MinCreateArgonMemoryKiB); err != nil {
+		t.Fatalf("ValidateForCreate(at floor) = %v, want nil", err)
 	}
 }

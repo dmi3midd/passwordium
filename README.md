@@ -9,11 +9,11 @@ A zero-exposure-RAM, single-file encrypted vault library in Go for storing sensi
   - **24-byte Nonce**: Random XChaCha20-Poly1305 nonce.
   - **Ciphertext**: Protobuf-encoded `VaultData` sealed with XChaCha20-Poly1305 using the entire 50-byte plaintext header as associated authenticated data (AAD).
 - **Two-Level Key Hierarchy (`internal/crypto`)**:
-  - `masterKey` derived from the master password and salt via **Argon2id**.
-  - `indexKey` (`HKDF-SHA256`, context `"passwordium:v1:index"`) encrypts the outer `VaultData` container.
-  - `secretKey` (`HKDF-SHA256`, context `"passwordium:v1:secret"`) encrypts each entry's `SecretPayload` individually with AAD `"<entry_id>:<entry_version>"`.
-- **Zero-Exposure RAM**: After `Open`, searchable entry metadata (`EntryMeta`) is indexed in memory while secrets stay encrypted until `GetSecret(id)` is called. `Close()` zeroes derived keys and entry secret buffers via `clear()`.
-- **Storage Backends (`storage.go`)**: `FileStorage` (atomic write via `os.CreateTemp`, `0600` permissions, `Sync`, `os.Rename`) and `MemoryStorage`.
+  - `masterKey` derived from the master password and salt via **Argon2id** (minimum 16 MiB enforced on `Create`; pre-KDF resource caps `DefaultMaxArgon2Params` / `WithMaxArgon2Params` enforced on `Open`) and immediately wiped after subkey derivation.
+  - `indexKey` (`HKDF-SHA256`, context `"passwordium:v1:index"`) initializes a single session AEAD (`crypto.Cipher`) to encrypt the outer `VaultData` container.
+  - `secretKey` (`HKDF-SHA256`, context `"passwordium:v1:secret"`) initializes a single session AEAD (`crypto.Cipher`) to encrypt each entry's `SecretPayload` individually with AAD `"<entry_id>:<entry_version>"`.
+- **Zero-Exposure RAM**: After `Open`, searchable entry metadata (`EntryMeta`) is indexed in memory while secrets stay encrypted until `GetSecret(id)` is called. `Close()` releases session AEAD instances and zeroes entry secret buffers via `clear()`.
+- **Storage Backends (`storage.go`)**: `FileStorage` (atomic write via `os.CreateTemp`, `0600` permissions, `Sync`, `os.Rename`, regular-file verification, and bounded reads via `DefaultMaxFileSize` / `WithMaxFileSize`) and `MemoryStorage`.
 
 ## Project Layout
 
@@ -39,7 +39,8 @@ passwordium/
 │       └── crypto_test.go
 ├── header_test.go
 ├── storage_test.go
-└── vault_test.go
+├── vault_test.go
+└── vault_security_test.go
 ```
 
 ## Usage
