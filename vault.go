@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"maps"
@@ -22,6 +23,11 @@ import (
 const (
 	hkdfContextIndex  = "passwordium:v1:index"
 	hkdfContextSecret = "passwordium:v1:secret"
+
+	// secretPadBlockSize is the block size (in bytes) to which serialized SecretPayload
+	// plaintexts are padded (ISO/IEC 7816-4: 0x80 followed by 0x00 bytes) before
+	// encryption, hiding exact password and note lengths within 256-byte buckets.
+	secretPadBlockSize = 256
 )
 
 // Vault is a thread-safe encrypted credential store backed by a Storage implementation.
@@ -39,6 +45,8 @@ type Vault struct {
 	entries      map[string]*entryRecord
 	version      uint64
 	updatedAt    int64
+	lastDigest   [32]byte
+	hasDigest    bool
 	dirty        bool
 	autoSave     bool
 	closed       bool
@@ -96,6 +104,39 @@ func entryAAD(id string, version uint64) []byte {
 	return []byte(fmt.Sprintf("%s:%d", id, version))
 }
 
+// padSecret pads src using ISO/IEC 7816-4 padding (0x80 followed by 0x00 bytes)
+// to the next multiple of secretPadBlockSize bytes.
+func padSecret(src []byte) []byte {
+	rem := (len(src) + 1) % secretPadBlockSize
+	padZeros := 0
+	if rem != 0 {
+		padZeros = secretPadBlockSize - rem
+	}
+	out := make([]byte, len(src)+1+padZeros)
+	copy(out, src)
+	out[len(src)] = 0x80
+	return out
+}
+
+// unpadSecret removes ISO/IEC 7816-4 padding from padded, returning a subslice
+// of padded without additional allocations.
+func unpadSecret(padded []byte) ([]byte, error) {
+	if len(padded) == 0 || len(padded)%secretPadBlockSize != 0 {
+		return nil, ErrSecretCorrupted
+	}
+	for i := len(padded) - 1; i >= 0; i-- {
+		switch padded[i] {
+		case 0x00:
+			continue
+		case 0x80:
+			return padded[:i], nil
+		default:
+			return nil, ErrSecretCorrupted
+		}
+	}
+	return nil, ErrSecretCorrupted
+}
+
 // deriveVaultCiphers runs Argon2id + HKDF-SHA256, initializes one AEAD per subkey,
 // and wipes masterKey, indexKey, and secretKey before returning on every path.
 func deriveVaultCiphers(masterPassword, salt []byte, params Argon2Params) (indexCipher, secretCipher *crypto.Cipher, err error) {
@@ -133,7 +174,10 @@ func deriveVaultCiphers(masterPassword, salt []byte, params Argon2Params) (index
 // derives keys from masterPassword using Argon2id + HKDF-SHA256, and immediately
 // saves the empty vault to store. Create refuses to replace an existing vault
 // (returning ErrAlreadyExists) unless WithOverwrite(true) is supplied, and rejects
-// Argon2id memory costs below 16 MiB.
+// Argon2id memory costs below 16 MiB or parameters exceeding DefaultMaxArgon2Params.
+//
+// Create does not mutate masterPassword; callers should zero masterPassword
+// (for example, via clear(masterPassword)) once it is no longer needed.
 func Create(ctx context.Context, store Storage, masterPassword []byte, opts ...CreateOption) (*Vault, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -156,11 +200,7 @@ func Create(ctx context.Context, store Storage, masterPassword []byte, opts ...C
 	}
 
 	if !cfg.overwrite {
-		_, err := store.Load(ctx)
-		switch {
-		case err == nil:
-			return nil, ErrAlreadyExists
-		case !errors.Is(err, ErrNotFound):
+		if err := checkStorageNotExists(ctx, store); err != nil {
 			return nil, err
 		}
 	}
@@ -190,18 +230,44 @@ func Create(ctx context.Context, store Storage, masterPassword []byte, opts ...C
 		autoSave:     cfg.autoSave,
 	}
 
-	if err := v.Save(ctx); err != nil {
+	if err := v.saveInitialLocked(ctx, cfg.overwrite); err != nil {
 		_ = v.Close()
 		return nil, err
 	}
 	return v, nil
 }
 
+func checkStorageNotExists(ctx context.Context, store Storage) error {
+	if ec, ok := store.(existenceChecker); ok {
+		exists, err := ec.Exists(ctx)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return ErrAlreadyExists
+		}
+		return nil
+	}
+	_, err := store.Load(ctx)
+	switch {
+	case err == nil:
+		return ErrAlreadyExists
+	case !errors.Is(err, ErrNotFound):
+		return err
+	default:
+		return nil
+	}
+}
+
 // Open loads an existing vault from store, enforces resource limits on the
 // plaintext header's Argon2id parameters (DefaultMaxArgon2Params, or the bounds
-// given via WithMaxArgon2Params) before running any key derivation, derives keys
-// from masterPassword, and decrypts the VaultData container index with the header
-// as AAD. Individual entry secrets remain encrypted in memory until GetSecret is called.
+// given via WithMaxArgon2Params / WithMaxArgon2Work) before running any key derivation,
+// derives keys from masterPassword, and decrypts the VaultData container index with
+// the header as AAD. Individual entry secrets remain encrypted in memory until
+// GetSecret is called.
+//
+// Open does not mutate masterPassword; callers should zero masterPassword
+// (for example, via clear(masterPassword)) once it is no longer needed.
 func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...OpenOption) (*Vault, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -223,12 +289,19 @@ func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...Ope
 		if err := max.toCrypto().Validate(); err != nil {
 			return nil, fmt.Errorf("%w: invalid max limits: %v", ErrInvalidArgon2Params, err)
 		}
+		maxWork := uint64(max.Time) * uint64(max.MemoryKiB)
+		if max.Time <= crypto.DefaultMaxArgonTime && max.MemoryKiB <= crypto.DefaultMaxArgonMemoryKiB && maxWork > crypto.DefaultMaxArgonWork {
+			maxWork = crypto.DefaultMaxArgonWork
+		}
 		limits = crypto.Argon2Limits{
 			MaxTime:      max.Time,
 			MaxMemoryKiB: max.MemoryKiB,
 			MaxThreads:   max.Threads,
-			MaxWork:      uint64(max.Time) * uint64(max.MemoryKiB),
+			MaxWork:      maxWork,
 		}
+	}
+	if cfg.hasMaxWork {
+		limits.MaxWork = cfg.maxArgon2Work
 	}
 
 	raw, err := store.Load(ctx)
@@ -273,6 +346,18 @@ func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...Ope
 			closeCiphers()
 			return nil, fmt.Errorf("%w: entry missing id", ErrCorruptedVault)
 		}
+		if e.Version == 0 {
+			closeCiphers()
+			return nil, fmt.Errorf("%w: entry %q has invalid version 0", ErrCorruptedVault, e.Id)
+		}
+		if len(e.SecretNonce) != crypto.NonceSize {
+			closeCiphers()
+			return nil, fmt.Errorf("%w: entry %q has invalid secret nonce size %d", ErrCorruptedVault, e.Id, len(e.SecretNonce))
+		}
+		if len(e.EncryptedSecret) < crypto.Overhead {
+			closeCiphers()
+			return nil, fmt.Errorf("%w: entry %q has truncated encrypted secret", ErrCorruptedVault, e.Id)
+		}
 		if _, dup := entries[e.Id]; dup {
 			closeCiphers()
 			return nil, fmt.Errorf("%w: duplicate entry id", ErrCorruptedVault)
@@ -286,9 +371,11 @@ func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...Ope
 			tags:            slices.Clone(e.Tags),
 			createdAt:       e.CreatedAt,
 			updatedAt:       e.UpdatedAt,
-			secretNonce:     bytes.Clone(e.SecretNonce),
-			encryptedSecret: bytes.Clone(e.EncryptedSecret),
+			secretNonce:     e.SecretNonce,
+			encryptedSecret: e.EncryptedSecret,
 		}
+		e.SecretNonce = nil
+		e.EncryptedSecret = nil
 	}
 
 	return &Vault{
@@ -299,6 +386,8 @@ func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...Ope
 		entries:      entries,
 		version:      pb.Version,
 		updatedAt:    pb.UpdatedAt,
+		lastDigest:   sha256.Sum256(raw),
+		hasDigest:    true,
 		autoSave:     cfg.autoSave,
 	}, nil
 }
@@ -351,7 +440,10 @@ func (v *Vault) Put(ctx context.Context, meta EntryMeta, secret Secret) (string,
 	}
 	defer crypto.ZeroBytes(plainSecret)
 
-	secretNonce, encryptedSecret, err := v.secretCipher.Encrypt(plainSecret, entryAAD(id, version))
+	paddedSecret := padSecret(plainSecret)
+	defer crypto.ZeroBytes(paddedSecret)
+
+	secretNonce, encryptedSecret, err := v.secretCipher.Encrypt(paddedSecret, entryAAD(id, version))
 	if err != nil {
 		return "", fmt.Errorf("passwordium: encrypt secret: %w", err)
 	}
@@ -430,8 +522,13 @@ func (v *Vault) GetSecret(id string) (Secret, error) {
 	}
 	defer crypto.ZeroBytes(plain)
 
+	unpadded, err := unpadSecret(plain)
+	if err != nil {
+		return Secret{}, err
+	}
+
 	var pb vaultpb.SecretPayload
-	if err := proto.Unmarshal(plain, &pb); err != nil {
+	if err := proto.Unmarshal(unpadded, &pb); err != nil {
 		return Secret{}, fmt.Errorf("%w: %w", ErrSecretCorrupted, err)
 	}
 
@@ -566,14 +663,7 @@ func (v *Vault) Save(ctx context.Context) error {
 	return v.saveLocked(ctx)
 }
 
-func (v *Vault) saveLocked(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	nextVersion := v.version + 1
-	now := time.Now().UTC().Unix()
-
+func (v *Vault) marshalEnvelopeLocked(nextVersion uint64, now int64) ([]byte, error) {
 	ids := slices.Sorted(maps.Keys(v.entries))
 	pbEntries := make([]*vaultpb.Entry, 0, len(ids))
 	for _, id := range ids {
@@ -586,35 +676,135 @@ func (v *Vault) saveLocked(ctx context.Context) error {
 		Entries:   pbEntries,
 	})
 	if err != nil {
-		return fmt.Errorf("passwordium: marshal vault: %w", err)
+		return nil, fmt.Errorf("passwordium: marshal vault: %w", err)
 	}
 	defer crypto.ZeroBytes(plaintext)
 
 	headerBytes := v.hdr.marshal()
 	nonce, ciphertext, err := v.indexCipher.Encrypt(plaintext, headerBytes)
 	if err != nil {
-		return fmt.Errorf("passwordium: encrypt vault: %w", err)
+		return nil, fmt.Errorf("passwordium: encrypt vault: %w", err)
+	}
+	return packEnvelope(headerBytes, nonce, ciphertext), nil
+}
+
+func (v *Vault) saveInitialLocked(ctx context.Context, overwrite bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
-	if err := v.store.Save(ctx, packEnvelope(headerBytes, nonce, ciphertext)); err != nil {
+	nextVersion := v.version + 1
+	now := time.Now().UTC().Unix()
+
+	envelope, err := v.marshalEnvelopeLocked(nextVersion, now)
+	if err != nil {
 		return err
+	}
+
+	if !overwrite {
+		if es, ok := v.store.(exclusiveSaver); ok {
+			if err := es.SaveNew(ctx, envelope); err != nil {
+				return err
+			}
+		} else {
+			if err := checkStorageNotExists(ctx, v.store); err != nil {
+				return err
+			}
+			if err := v.store.Save(ctx, envelope); err != nil {
+				return err
+			}
+		}
+	} else {
+		if err := v.store.Save(ctx, envelope); err != nil {
+			return err
+		}
 	}
 
 	v.version = nextVersion
 	v.updatedAt = now
+	v.lastDigest = sha256.Sum256(envelope)
+	v.hasDigest = true
+	v.dirty = false
+	return nil
+}
+
+func (v *Vault) saveLocked(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	nextVersion := v.version + 1
+	now := time.Now().UTC().Unix()
+
+	envelope, err := v.marshalEnvelopeLocked(nextVersion, now)
+	if err != nil {
+		return err
+	}
+
+	if v.hasDigest {
+		if cs, ok := v.store.(conditionalSaver); ok {
+			if err := cs.SaveIfMatch(ctx, envelope, v.lastDigest); err != nil {
+				return err
+			}
+		} else {
+			if err := v.store.Save(ctx, envelope); err != nil {
+				return err
+			}
+		}
+	} else {
+		if err := v.store.Save(ctx, envelope); err != nil {
+			return err
+		}
+	}
+
+	v.version = nextVersion
+	v.updatedAt = now
+	v.lastDigest = sha256.Sum256(envelope)
+	v.hasDigest = true
 	v.dirty = false
 	return nil
 }
 
 // Close releases the session AEAD instances, zeroes all encrypted entry secrets
 // in memory, clears the in-memory entry map, and prevents further operations on
-// the Vault. Calling Close multiple times is safe and idempotent.
+// the Vault. Any unsaved in-memory modifications (Dirty() == true) are discarded
+// without writing to Storage; call Save before Close, use CloseWithSave, or enable
+// WithAutoSave to persist changes. Calling Close multiple times is safe and idempotent.
 func (v *Vault) Close() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.closeLocked()
+	return nil
+}
+
+// CloseWithSave persists any unsaved in-memory modifications (when Dirty() is true)
+// to Storage before closing and wiping the Vault. If saving fails, the Vault remains
+// open and retains its in-memory state so the caller can retry or recover.
+// Calling CloseWithSave on an already-closed Vault is a no-op and returns nil.
+func (v *Vault) CloseWithSave(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
 	if v.closed {
 		return nil
+	}
+	if v.dirty {
+		if err := v.saveLocked(ctx); err != nil {
+			return err
+		}
+	}
+	v.closeLocked()
+	return nil
+}
+
+func (v *Vault) closeLocked() {
+	if v.closed {
+		return
 	}
 
 	v.indexCipher.Close()
@@ -627,9 +817,10 @@ func (v *Vault) Close() error {
 	}
 	clear(v.entries)
 	v.entries = nil
+	crypto.ZeroBytes(v.lastDigest[:])
+	v.hasDigest = false
 	v.dirty = false
 	v.closed = true
-	return nil
 }
 
 // Dirty reports whether the vault has unsaved in-memory modifications.

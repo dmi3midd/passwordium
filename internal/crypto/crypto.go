@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -157,9 +158,11 @@ func (p Argon2Params) ValidateLimits(limits Argon2Limits) error {
 	return nil
 }
 
-// ValidateForCreate verifies that p is valid and meets the minimum memory floor minMemoryKiB.
+// ValidateForCreate verifies that p is valid, satisfies DefaultArgon2Limits (so a vault
+// created with p can always be opened with default Open limits), and meets the minimum
+// memory floor minMemoryKiB.
 func (p Argon2Params) ValidateForCreate(minMemoryKiB uint32) error {
-	if err := p.Validate(); err != nil {
+	if err := p.ValidateLimits(DefaultArgon2Limits()); err != nil {
 		return err
 	}
 	if p.MemoryKiB < minMemoryKiB {
@@ -198,6 +201,7 @@ func DeriveSubKey(masterKey []byte, contextInfo string) ([]byte, error) {
 // Cipher wraps an initialized XChaCha20-Poly1305 AEAD instance so the symmetric key
 // is copied into the AEAD once per vault session rather than on every operation.
 type Cipher struct {
+	mu   sync.RWMutex
 	aead cipher.AEAD
 }
 
@@ -216,7 +220,12 @@ func NewCipher(key []byte) (*Cipher, error) {
 // Encrypt encrypts plaintext and authenticates associatedData with a freshly
 // generated 24-byte random nonce.
 func (c *Cipher) Encrypt(plaintext, associatedData []byte) (nonce, ciphertext []byte, err error) {
-	if c == nil || c.aead == nil {
+	if c == nil {
+		return nil, nil, ErrCipherClosed
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.aead == nil {
 		return nil, nil, ErrCipherClosed
 	}
 
@@ -231,7 +240,12 @@ func (c *Cipher) Encrypt(plaintext, associatedData []byte) (nonce, ciphertext []
 
 // Decrypt authenticates associatedData and decrypts ciphertext.
 func (c *Cipher) Decrypt(nonce, ciphertext, associatedData []byte) ([]byte, error) {
-	if c == nil || c.aead == nil {
+	if c == nil {
+		return nil, ErrCipherClosed
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.aead == nil {
 		return nil, ErrCipherClosed
 	}
 	if len(nonce) != NonceSize {
@@ -253,7 +267,9 @@ func (c *Cipher) Decrypt(nonce, ciphertext, associatedData []byte) ([]byte, erro
 // dropping the reference makes it unreachable for the garbage collector.
 func (c *Cipher) Close() {
 	if c != nil {
+		c.mu.Lock()
 		c.aead = nil
+		c.mu.Unlock()
 	}
 }
 

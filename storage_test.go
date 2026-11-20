@@ -166,8 +166,23 @@ func TestFileStorageLoadHardening(t *testing.T) {
 		if err := os.Symlink(target, link); err != nil {
 			t.Skipf("symlinks unsupported: %v", err)
 		}
-		if _, err := NewFileStorage(link).Load(ctx); !errors.Is(err, ErrInvalidStorageFile) {
+		fs := NewFileStorage(link)
+		if _, err := fs.Load(ctx); !errors.Is(err, ErrInvalidStorageFile) {
 			t.Fatalf("symlink Load err = %v, want ErrInvalidStorageFile", err)
+		}
+		if _, err := fs.Exists(ctx); !errors.Is(err, ErrInvalidStorageFile) {
+			t.Fatalf("symlink Exists err = %v, want ErrInvalidStorageFile", err)
+		}
+		if err := fs.Save(ctx, []byte("overwrite")); !errors.Is(err, ErrInvalidStorageFile) {
+			t.Fatalf("symlink Save err = %v, want ErrInvalidStorageFile", err)
+		}
+		if err := fs.SaveNew(ctx, []byte("new")); !errors.Is(err, ErrInvalidStorageFile) {
+			t.Fatalf("symlink SaveNew err = %v, want ErrInvalidStorageFile", err)
+		}
+		// Ensure the symlink itself was not replaced by Save/SaveNew.
+		linfo, err := os.Lstat(link)
+		if err != nil || linfo.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("symlink was clobbered: linfo=%+v err=%v", linfo, err)
 		}
 	})
 
@@ -176,8 +191,15 @@ func TestFileStorageLoadHardening(t *testing.T) {
 		if err := os.Mkdir(sub, 0o700); err != nil {
 			t.Fatalf("Mkdir: %v", err)
 		}
-		if _, err := NewFileStorage(sub).Load(ctx); !errors.Is(err, ErrInvalidStorageFile) {
+		fs := NewFileStorage(sub)
+		if _, err := fs.Load(ctx); !errors.Is(err, ErrInvalidStorageFile) {
 			t.Fatalf("directory Load err = %v, want ErrInvalidStorageFile", err)
+		}
+		if err := fs.Save(ctx, []byte("x")); !errors.Is(err, ErrInvalidStorageFile) {
+			t.Fatalf("directory Save err = %v, want ErrInvalidStorageFile", err)
+		}
+		if err := fs.SaveNew(ctx, []byte("x")); !errors.Is(err, ErrInvalidStorageFile) {
+			t.Fatalf("directory SaveNew err = %v, want ErrInvalidStorageFile", err)
 		}
 	})
 

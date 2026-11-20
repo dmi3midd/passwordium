@@ -3,6 +3,7 @@ package passwordium
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +21,32 @@ type Storage interface {
 	Load(ctx context.Context) ([]byte, error)
 	Save(ctx context.Context, data []byte) error
 }
+
+// existenceChecker is an optional Storage extension that checks whether a vault
+// exists without reading the entire payload into memory.
+type existenceChecker interface {
+	Exists(ctx context.Context) (bool, error)
+}
+
+// exclusiveSaver is an optional Storage extension that atomically persists a new
+// vault only if no vault currently exists in the backend.
+type exclusiveSaver interface {
+	SaveNew(ctx context.Context, data []byte) error
+}
+
+// conditionalSaver is an optional Storage extension that atomically persists data
+// only if the currently stored vault bytes still match expectedDigest.
+type conditionalSaver interface {
+	SaveIfMatch(ctx context.Context, data []byte, expectedDigest [32]byte) error
+}
+
+type fileSaveMode int
+
+const (
+	saveModeOverwrite fileSaveMode = iota
+	saveModeExclusive
+	saveModeIfMatch
+)
 
 // FileStorageOption configures FileStorage.
 type FileStorageOption func(*FileStorage)
@@ -115,9 +142,108 @@ func (s *FileStorage) Load(ctx context.Context) ([]byte, error) {
 	return data, nil
 }
 
+// Exists reports whether a regular vault file exists at s.path without reading its contents.
+// It returns ErrInvalidStorageFile if the path exists and is not a regular file.
+func (s *FileStorage) Exists(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if s.path == "" {
+		return false, errors.New("passwordium: file storage path is empty")
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	linfo, err := os.Lstat(s.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("passwordium: stat vault file: %w", err)
+	}
+	if !linfo.Mode().IsRegular() {
+		return false, fmt.Errorf("%w: mode %s", ErrInvalidStorageFile, linfo.Mode().Type())
+	}
+	return true, nil
+}
+
 // Save atomically writes data to disk via a 0600 temporary file in the same
-// directory, fsyncing before renaming into place.
+// directory, fsyncing before renaming into place. It returns ErrInvalidStorageFile
+// if the target path exists and is not a regular file.
 func (s *FileStorage) Save(ctx context.Context, data []byte) error {
+	return s.save(ctx, data, saveModeOverwrite, [32]byte{})
+}
+
+// SaveNew atomically writes data to disk only if no file currently exists at s.path,
+// returning ErrAlreadyExists if a regular file is already present or ErrInvalidStorageFile
+// if the path is a symlink or other non-regular file.
+func (s *FileStorage) SaveNew(ctx context.Context, data []byte) error {
+	return s.save(ctx, data, saveModeExclusive, [32]byte{})
+}
+
+// SaveIfMatch atomically writes data to disk only if the existing regular file at s.path
+// still has SHA-256 digest expectedDigest, returning ErrConcurrentModification otherwise.
+func (s *FileStorage) SaveIfMatch(ctx context.Context, data []byte, expectedDigest [32]byte) error {
+	return s.save(ctx, data, saveModeIfMatch, expectedDigest)
+}
+
+func (s *FileStorage) readLockedDigest() (os.FileInfo, [32]byte, error) {
+	maxSize := s.maxSize
+	if maxSize <= 0 {
+		maxSize = DefaultMaxFileSize
+	}
+
+	linfo, err := os.Lstat(s.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, [32]byte{}, ErrConcurrentModification
+		}
+		return nil, [32]byte{}, fmt.Errorf("passwordium: stat vault file: %w", err)
+	}
+	if !linfo.Mode().IsRegular() {
+		return nil, [32]byte{}, fmt.Errorf("%w: mode %s", ErrInvalidStorageFile, linfo.Mode().Type())
+	}
+	if linfo.Size() > maxSize {
+		return nil, [32]byte{}, ErrConcurrentModification
+	}
+
+	f, err := os.Open(s.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, [32]byte{}, ErrConcurrentModification
+		}
+		return nil, [32]byte{}, fmt.Errorf("passwordium: open vault file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	finfo, err := f.Stat()
+	if err != nil {
+		return nil, [32]byte{}, fmt.Errorf("passwordium: fstat vault file: %w", err)
+	}
+	if !finfo.Mode().IsRegular() || !os.SameFile(linfo, finfo) {
+		return nil, [32]byte{}, fmt.Errorf("%w: file changed during open", ErrInvalidStorageFile)
+	}
+
+	h := sha256.New()
+	n, err := io.Copy(h, io.LimitReader(f, maxSize+1))
+	if err != nil {
+		return nil, [32]byte{}, fmt.Errorf("passwordium: read vault file: %w", err)
+	}
+	if n > maxSize {
+		return nil, [32]byte{}, ErrConcurrentModification
+	}
+
+	var digest [32]byte
+	copy(digest[:], h.Sum(nil))
+	return linfo, digest, nil
+}
+
+func (s *FileStorage) save(ctx context.Context, data []byte, mode fileSaveMode, expectedDigest [32]byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -130,6 +256,38 @@ func (s *FileStorage) Save(ctx context.Context, data []byte) error {
 
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	var origInfo os.FileInfo
+	switch mode {
+	case saveModeExclusive:
+		linfo, err := os.Lstat(s.path)
+		if err == nil {
+			if !linfo.Mode().IsRegular() {
+				return fmt.Errorf("%w: mode %s", ErrInvalidStorageFile, linfo.Mode().Type())
+			}
+			return ErrAlreadyExists
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("passwordium: stat vault file: %w", err)
+		}
+	case saveModeIfMatch:
+		linfo, actualDigest, err := s.readLockedDigest()
+		if err != nil {
+			return err
+		}
+		if actualDigest != expectedDigest {
+			return ErrConcurrentModification
+		}
+		origInfo = linfo
+	case saveModeOverwrite:
+		linfo, err := os.Lstat(s.path)
+		if err == nil {
+			if !linfo.Mode().IsRegular() {
+				return fmt.Errorf("%w: mode %s", ErrInvalidStorageFile, linfo.Mode().Type())
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("passwordium: stat vault file: %w", err)
+		}
 	}
 
 	dir := filepath.Dir(s.path)
@@ -180,12 +338,50 @@ func (s *FileStorage) Save(ctx context.Context, data []byte) error {
 		return err
 	}
 
-	if err := os.Rename(tmpName, s.path); err != nil {
+	switch mode {
+	case saveModeExclusive:
+		if err := os.Link(tmpName, s.path); err != nil {
+			_ = os.Remove(tmpName)
+			if errors.Is(err, os.ErrExist) {
+				if linfo, lerr := os.Lstat(s.path); lerr == nil && !linfo.Mode().IsRegular() {
+					return fmt.Errorf("%w: mode %s", ErrInvalidStorageFile, linfo.Mode().Type())
+				}
+				return ErrAlreadyExists
+			}
+			return fmt.Errorf("passwordium: link vault file: %w", err)
+		}
 		_ = os.Remove(tmpName)
-		return fmt.Errorf("passwordium: rename vault file: %w", err)
+	case saveModeIfMatch:
+		linfo, actualDigest, err := s.readLockedDigest()
+		if err != nil {
+			_ = os.Remove(tmpName)
+			return err
+		}
+		if !os.SameFile(origInfo, linfo) || actualDigest != expectedDigest {
+			_ = os.Remove(tmpName)
+			return ErrConcurrentModification
+		}
+		if err := os.Rename(tmpName, s.path); err != nil {
+			_ = os.Remove(tmpName)
+			return fmt.Errorf("passwordium: rename vault file: %w", err)
+		}
+	case saveModeOverwrite:
+		if linfo, err := os.Lstat(s.path); err == nil {
+			if !linfo.Mode().IsRegular() {
+				_ = os.Remove(tmpName)
+				return fmt.Errorf("%w: mode %s", ErrInvalidStorageFile, linfo.Mode().Type())
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			_ = os.Remove(tmpName)
+			return fmt.Errorf("passwordium: stat vault file: %w", err)
+		}
+		if err := os.Rename(tmpName, s.path); err != nil {
+			_ = os.Remove(tmpName)
+			return fmt.Errorf("passwordium: rename vault file: %w", err)
+		}
 	}
 
-	// Best-effort directory sync so the rename metadata reaches stable storage.
+	// Best-effort directory sync so the rename/link metadata reaches stable storage.
 	if d, err := os.Open(dir); err == nil {
 		_ = d.Sync()
 		_ = d.Close()
@@ -205,6 +401,21 @@ type MemoryStorage struct {
 // NewMemoryStorage returns an empty MemoryStorage.
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{}
+}
+
+// Exists reports whether any vault data has been saved in memory.
+func (m *MemoryStorage) Exists(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return m.exists, nil
 }
 
 // Load returns a copy of the stored vault bytes, or ErrNotFound if nothing has been saved.
@@ -239,5 +450,46 @@ func (m *MemoryStorage) Save(ctx context.Context, data []byte) error {
 	}
 	m.data = bytes.Clone(data)
 	m.exists = true
+	return nil
+}
+
+// SaveNew stores a defensive copy of data only if the MemoryStorage is currently empty,
+// returning ErrAlreadyExists otherwise.
+func (m *MemoryStorage) SaveNew(ctx context.Context, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.exists {
+		return ErrAlreadyExists
+	}
+	m.data = bytes.Clone(data)
+	m.exists = true
+	return nil
+}
+
+// SaveIfMatch atomically replaces the stored bytes only if their current SHA-256 digest
+// equals expectedDigest, returning ErrConcurrentModification otherwise.
+func (m *MemoryStorage) SaveIfMatch(ctx context.Context, data []byte, expectedDigest [32]byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !m.exists || sha256.Sum256(m.data) != expectedDigest {
+		return ErrConcurrentModification
+	}
+	m.data = bytes.Clone(data)
 	return nil
 }

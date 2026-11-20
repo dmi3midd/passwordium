@@ -44,4 +44,7 @@ var (
 
 	// ErrInvalidStorageFile is returned when FileStorage points to a non-regular file (symlink, FIFO, device, or directory).
 	ErrInvalidStorageFile = errors.New("passwordium: storage path is not a regular file")
+
+	// ErrConcurrentModification is returned by Save when the underlying vault in Storage was modified since it was opened or last saved.
+	ErrConcurrentModification = errors.New("passwordium: vault was modified concurrently in storage")
 )

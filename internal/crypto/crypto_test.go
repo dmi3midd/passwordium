@@ -341,4 +341,8 @@ func TestArgon2ParamsValidateForCreate(t *testing.T) {
 	if err := floor.ValidateForCreate(MinCreateArgonMemoryKiB); err != nil {
 		t.Fatalf("ValidateForCreate(at floor) = %v, want nil", err)
 	}
+	overOpenLimit := Argon2Params{Time: DefaultMaxArgonTime + 1, MemoryKiB: MinCreateArgonMemoryKiB, Threads: 1}
+	if err := overOpenLimit.ValidateForCreate(MinCreateArgonMemoryKiB); !errors.Is(err, ErrInvalidArgon2Params) {
+		t.Fatalf("ValidateForCreate(over default open limit) = %v, want ErrInvalidArgon2Params", err)
+	}
 }

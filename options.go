@@ -28,6 +28,8 @@ type createConfig struct {
 type openConfig struct {
 	hasMaxArgon2    bool
 	maxArgon2Params Argon2Params
+	hasMaxWork      bool
+	maxArgon2Work   uint64
 	autoSave        bool
 }
 
@@ -49,8 +51,9 @@ func (o autoSaveOption) applyCreate(cfg *createConfig) { cfg.autoSave = bool(o) 
 func (o autoSaveOption) applyOpen(cfg *openConfig)     { cfg.autoSave = bool(o) }
 
 // WithArgon2Params overrides the default Argon2id parameters when creating a vault.
-// Create rejects parameters with MemoryKiB below 16 MiB (16384 KiB). Use Argon2ParamsMiB
-// to avoid KiB/MiB unit mistakes.
+// Create rejects parameters with MemoryKiB below 16 MiB (16384 KiB) or exceeding
+// DefaultMaxArgon2Params limits (Time=16, Memory=512 MiB, Threads=16, Time*Memory<=2 GiB-passes).
+// Use Argon2ParamsMiB to avoid KiB/MiB unit mistakes.
 func WithArgon2Params(params Argon2Params) CreateOption {
 	return createOptionFunc(func(cfg *createConfig) {
 		cfg.argon2Params = params
@@ -76,13 +79,26 @@ func WithOverwrite(enabled bool) CreateOption {
 }
 
 // WithMaxArgon2Params sets the upper bounds on Argon2id parameters that Open will
-// execute from an untrusted header. The combined work limit becomes max.Time * max.MemoryKiB.
+// execute from an untrusted header. When max.Time and max.MemoryKiB do not exceed
+// DefaultMaxArgon2Params, the default 2 GiB-passes work limit continues to apply
+// (unless overridden via WithMaxArgon2Work); when either bound is raised above
+// default, the combined work limit becomes max.Time * max.MemoryKiB.
 // Headers exceeding the limits are rejected with ErrInvalidArgon2Params before any
 // key derivation runs. Without this option, DefaultMaxArgon2Params limits apply.
 func WithMaxArgon2Params(max Argon2Params) OpenOption {
 	return openOptionFunc(func(cfg *openConfig) {
 		cfg.hasMaxArgon2 = true
 		cfg.maxArgon2Params = max
+	})
+}
+
+// WithMaxArgon2Work sets an explicit upper bound on uint64(Time) * uint64(MemoryKiB)
+// accepted by Open before running Argon2id. Passing 0 disables the product check while
+// keeping per-parameter bounds enforced.
+func WithMaxArgon2Work(maxWorkKiBPasses uint64) OpenOption {
+	return openOptionFunc(func(cfg *openConfig) {
+		cfg.hasMaxWork = true
+		cfg.maxArgon2Work = maxWorkKiBPasses
 	})
 }
 

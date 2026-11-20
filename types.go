@@ -2,6 +2,7 @@ package passwordium
 
 import (
 	"fmt"
+	"log/slog"
 	"math"
 	"time"
 
@@ -94,10 +95,33 @@ type EntryMeta struct {
 
 // Secret holds the sensitive payload of a vault entry.
 // It remains encrypted at rest in memory and is decrypted only when GetSecret is called.
+//
+// Because Go strings are immutable, decrypted Password, Notes, and CustomFields values
+// remain in garbage-collected heap memory after GetSecret or Put returns.
+// String, GoString, and LogValue redact the payload to prevent accidental leakage into logs.
 type Secret struct {
 	Password     string
 	Notes        string
 	CustomFields map[string]string
+}
+
+const redactedSecretString = "passwordium.Secret{REDACTED}"
+
+// String returns a redacted placeholder so formatting a Secret with fmt (%s, %v, %+v)
+// never leaks credentials.
+func (Secret) String() string {
+	return redactedSecretString
+}
+
+// GoString returns a redacted placeholder so formatting a Secret with fmt (%#v)
+// never leaks credentials.
+func (Secret) GoString() string {
+	return redactedSecretString
+}
+
+// LogValue implements slog.LogValuer so structured loggers redact Secret values automatically.
+func (Secret) LogValue() slog.Value {
+	return slog.StringValue("[REDACTED]")
 }
 
 // SearchQuery filters vault entries in memory.

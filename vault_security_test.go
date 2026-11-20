@@ -1,15 +1,23 @@
 package passwordium
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"log/slog"
 	"math"
+	"path/filepath"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/dmi3midd/passwordium/internal/crypto"
+	"github.com/dmi3midd/passwordium/internal/vaultpb"
+	"google.golang.org/protobuf/proto"
 )
 
 // craftEnvelope builds a syntactically valid envelope with arbitrary header params
@@ -337,4 +345,535 @@ func TestCraftEnvelopeLayout(t *testing.T) {
 	if binary.BigEndian.Uint32(raw[38:42]) != 2 || binary.BigEndian.Uint32(raw[42:46]) != 128 || binary.BigEndian.Uint32(raw[46:50]) != 3 {
 		t.Fatal("craftEnvelope wrote unexpected header params")
 	}
+}
+
+// Audit FINDING-01: concurrent Create calls without WithOverwrite(true) must not overwrite
+// each other, and Create must not read the entire existing file into memory just to fail.
+func TestConcurrentCreateDoesNotOverwriteAndAvoidsFullRead(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	// 1. Existing oversized file is detected via Lstat (Exists) without reading it into RAM.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "existing.psdm")
+	bigStore := NewFileStorage(path, WithMaxFileSize(128))
+	if err := bigStore.Save(ctx, bytes.Repeat([]byte{0x42}, 1024)); err != nil {
+		t.Fatalf("Save oversized fixture: %v", err)
+	}
+	if _, err := Create(ctx, bigStore, []byte("pw"), fastTestArgon2()); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("Create on existing oversized file err = %v, want ErrAlreadyExists", err)
+	}
+
+	// 2. Concurrent Create race on both MemoryStorage and FileStorage.
+	backends := []struct {
+		name  string
+		store func(t *testing.T) Storage
+	}{
+		{
+			name:  "MemoryStorage",
+			store: func(t *testing.T) Storage { return NewMemoryStorage() },
+		},
+		{
+			name: "FileStorage",
+			store: func(t *testing.T) Storage {
+				return NewFileStorage(filepath.Join(t.TempDir(), "race.psdm"))
+			},
+		},
+	}
+
+	for _, tc := range backends {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			store := tc.store(t)
+
+			const contenders = 6
+			start := make(chan struct{})
+			type result struct {
+				pass []byte
+				v    *Vault
+				err  error
+			}
+			results := make(chan result, contenders)
+
+			var wg sync.WaitGroup
+			for i := range contenders {
+				wg.Add(1)
+				go func(idx int) {
+					defer wg.Done()
+					pw := []byte(fmt.Sprintf("contender-pass-%d", idx))
+					<-start
+					v, err := Create(ctx, store, pw, fastTestArgon2())
+					results <- result{pass: pw, v: v, err: err}
+				}(i)
+			}
+			close(start)
+			wg.Wait()
+			close(results)
+
+			var winners []result
+			alreadyExistsCount := 0
+			for r := range results {
+				switch {
+				case r.err == nil:
+					winners = append(winners, r)
+				case errors.Is(r.err, ErrAlreadyExists):
+					alreadyExistsCount++
+				default:
+					t.Fatalf("unexpected Create error: %v", r.err)
+				}
+			}
+
+			if len(winners) != 1 || alreadyExistsCount != contenders-1 {
+				t.Fatalf("winners=%d alreadyExists=%d, want 1 and %d", len(winners), alreadyExistsCount, contenders-1)
+			}
+			_ = winners[0].v.Close()
+
+			// The persisted vault must belong to the sole winner.
+			reopened, err := Open(ctx, store, winners[0].pass)
+			if err != nil {
+				t.Fatalf("winner password failed to open persisted vault: %v", err)
+			}
+			_ = reopened.Close()
+		})
+	}
+}
+
+// Audit FINDING-02: Create rejects parameters above DefaultArgon2Limits so a newly created
+// vault can always be opened by default Open; WithMaxArgon2Params(DefaultMaxArgon2Params())
+// preserves the default 2 GiB-passes MaxWork bound unless overridden.
+func TestArgon2CreateUpperBoundsAndMaxWorkPreservation(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := NewMemoryStorage()
+
+	overDefaultCases := map[string]Argon2Params{
+		"time_over_default":    {Time: crypto.DefaultMaxArgonTime + 1, MemoryKiB: 16 * 1024, Threads: 1},
+		"memory_over_default":  {Time: 1, MemoryKiB: crypto.DefaultMaxArgonMemoryKiB + 1024, Threads: 1},
+		"threads_over_default": {Time: 1, MemoryKiB: 16 * 1024, Threads: crypto.DefaultMaxArgonThreads + 1},
+		"work_over_default":    {Time: 8, MemoryKiB: crypto.DefaultMaxArgonMemoryKiB, Threads: 1}, // 4 GiB-passes > 2 GiB-passes
+	}
+	for name, p := range overDefaultCases {
+		if _, err := Create(ctx, store, []byte("pw"), WithArgon2Params(p)); !errors.Is(err, ErrInvalidArgon2Params) {
+			t.Fatalf("Create(%s: %+v) err = %v, want ErrInvalidArgon2Params", name, p, err)
+		}
+	}
+
+	// Passing DefaultMaxArgon2Params() (or tweaking Threads on it) to WithMaxArgon2Params
+	// must NOT weaken MaxWork from 2 GiB-passes to 8 GiB-passes.
+	workHeavyHeader := Argon2Params{Time: 8, MemoryKiB: 512 * 1024, Threads: 1} // 4 GiB-passes
+	if err := store.Save(ctx, craftEnvelope(workHeavyHeader)); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	maxCfg := DefaultMaxArgon2Params()
+	maxCfg.Threads = 2
+	start := time.Now()
+	if _, err := Open(ctx, store, []byte("pw"), WithMaxArgon2Params(maxCfg)); !errors.Is(err, ErrInvalidArgon2Params) {
+		t.Fatalf("Open with DefaultMaxArgon2Params should enforce 2 GiB-passes MaxWork, got err = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Open took %v; MaxWork check did not run before KDF", elapsed)
+	}
+
+	// WithMaxArgon2Work can tighten or explicitly override the work product cap.
+	smallHeader := Argon2Params{Time: 4, MemoryKiB: 64, Threads: 1} // work = 256 KiB-passes
+	if err := store.Save(ctx, craftEnvelope(smallHeader)); err != nil {
+		t.Fatalf("Save smallHeader: %v", err)
+	}
+	if _, err := Open(ctx, store, []byte("pw"), WithMaxArgon2Work(128)); !errors.Is(err, ErrInvalidArgon2Params) {
+		t.Fatalf("Open under tight WithMaxArgon2Work err = %v, want ErrInvalidArgon2Params", err)
+	}
+	if _, err := Open(ctx, store, []byte("pw"), WithMaxArgon2Work(256)); !errors.Is(err, ErrInvalidPassword) {
+		t.Fatalf("Open at exact WithMaxArgon2Work err = %v, want ErrInvalidPassword", err)
+	}
+}
+
+// Audit FINDING-04: Secret redacts its contents in fmt and log/slog output.
+func TestSecretRedactionInFmtAndSlog(t *testing.T) {
+	t.Parallel()
+
+	sec := Secret{
+		Password:     "ultra-secret-password-98765",
+		Notes:        "recovery phrase alpha beta gamma",
+		CustomFields: map[string]string{"totp": "JBSWY3DPEHPK3PXP"},
+	}
+
+	formatted := []string{
+		fmt.Sprint(sec),
+		fmt.Sprintf("%s", sec),
+		fmt.Sprintf("%v", sec),
+		fmt.Sprintf("%+v", sec),
+		fmt.Sprintf("%#v", sec),
+		fmt.Sprintf("%+v", &sec),
+		fmt.Sprintf("%#v", &sec),
+	}
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	logger.Info("loaded secret", "secret", sec, "secret_ptr", &sec)
+	formatted = append(formatted, logBuf.String())
+
+	for _, out := range formatted {
+		for _, sensitive := range []string{sec.Password, sec.Notes, "JBSWY3DPEHPK3PXP"} {
+			if strings.Contains(out, sensitive) {
+				t.Fatalf("sensitive value %q leaked in output %q", sensitive, out)
+			}
+		}
+	}
+}
+
+// Audit FINDING-05: CloseWithSave persists dirty state before closing and keeps the
+// vault open on save failure so in-memory changes are never silently lost.
+func TestVaultCloseWithSave(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	mem := NewMemoryStorage()
+	fs := &failingStorage{inner: mem, err: errors.New("io failure")}
+	pass := []byte("close-with-save-pass")
+
+	v, err := Create(ctx, fs, pass, fastTestArgon2())
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	id, err := v.Put(ctx, EntryMeta{Title: "Unsaved"}, Secret{Password: "must-survive"})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if !v.Dirty() {
+		t.Fatal("vault must be dirty after Put without autosave")
+	}
+
+	// Failing save during CloseWithSave must leave the vault open and dirty.
+	fs.failSave.Store(true)
+	if err := v.CloseWithSave(ctx); !errors.Is(err, fs.err) {
+		t.Fatalf("CloseWithSave on failing storage err = %v, want %v", err, fs.err)
+	}
+	if !v.Dirty() || v.Len() != 1 {
+		t.Fatalf("vault state lost after failed CloseWithSave: Dirty=%v Len=%d", v.Dirty(), v.Len())
+	}
+
+	// Once storage recovers, CloseWithSave persists and closes cleanly.
+	fs.failSave.Store(false)
+	if err := v.CloseWithSave(ctx); err != nil {
+		t.Fatalf("CloseWithSave: %v", err)
+	}
+	if err := v.CloseWithSave(ctx); err != nil {
+		t.Fatalf("idempotent CloseWithSave: %v", err)
+	}
+
+	reopened, err := Open(ctx, mem, pass)
+	if err != nil {
+		t.Fatalf("Open after CloseWithSave: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	sec, err := reopened.GetSecret(id)
+	if err != nil || sec.Password != "must-survive" {
+		t.Fatalf("GetSecret after CloseWithSave = %q, err=%v", sec.Password, err)
+	}
+}
+
+// Audit RISK-01: concurrent modification of the underlying storage by another Vault
+// instance is detected on Save (and Put/Delete with WithAutoSave) instead of silently
+// overwriting newer data.
+func TestConcurrentVaultModificationDetected(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	backends := []struct {
+		name  string
+		store func(t *testing.T) Storage
+	}{
+		{
+			name:  "MemoryStorage",
+			store: func(t *testing.T) Storage { return NewMemoryStorage() },
+		},
+		{
+			name: "FileStorage",
+			store: func(t *testing.T) Storage {
+				return NewFileStorage(filepath.Join(t.TempDir(), "occ.psdm"))
+			},
+		},
+	}
+
+	for _, tc := range backends {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			store := tc.store(t)
+			pass := []byte("occ-master-pass")
+
+			vInit, err := Create(ctx, store, pass, fastTestArgon2())
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			idSeed, err := vInit.Put(ctx, EntryMeta{Title: "Seed"}, Secret{Password: "v1"})
+			if err != nil {
+				t.Fatalf("Put seed: %v", err)
+			}
+			if err := vInit.Save(ctx); err != nil {
+				t.Fatalf("Save seed: %v", err)
+			}
+			_ = vInit.Close()
+
+			// Two separate sessions open the same vault concurrently.
+			v1, err := Open(ctx, store, pass)
+			if err != nil {
+				t.Fatalf("Open v1: %v", err)
+			}
+			defer func() { _ = v1.Close() }()
+
+			v2, err := Open(ctx, store, pass, WithAutoSave(true))
+			if err != nil {
+				t.Fatalf("Open v2: %v", err)
+			}
+			defer func() { _ = v2.Close() }()
+
+			// Session 1 updates and saves first.
+			if _, err := v1.Put(ctx, EntryMeta{ID: idSeed, Title: "Seed from v1"}, Secret{Password: "v1-updated"}); err != nil {
+				t.Fatalf("v1.Put: %v", err)
+			}
+			if err := v1.Save(ctx); err != nil {
+				t.Fatalf("v1.Save: %v", err)
+			}
+
+			// Session 2 now has a stale view; its auto-save Put must fail with ErrConcurrentModification
+			// and roll back its in-memory mutation.
+			if _, err := v2.Put(ctx, EntryMeta{Title: "Stale write"}, Secret{Password: "stale"}); !errors.Is(err, ErrConcurrentModification) {
+				t.Fatalf("v2.Put on stale vault err = %v, want ErrConcurrentModification", err)
+			}
+			if v2.Len() != 1 || v2.Dirty() {
+				t.Fatalf("v2 state after failed autosave: Len=%d Dirty=%v", v2.Len(), v2.Dirty())
+			}
+
+			// Verify v1's saved data is intact on disk/memory.
+			v3, err := Open(ctx, store, pass)
+			if err != nil {
+				t.Fatalf("Open v3: %v", err)
+			}
+			defer func() { _ = v3.Close() }()
+			sec, err := v3.GetSecret(idSeed)
+			if err != nil || sec.Password != "v1-updated" {
+				t.Fatalf("stored secret after conflict = %q, err=%v", sec.Password, err)
+			}
+		})
+	}
+}
+
+// Audit RISK-03: SecretPayload plaintexts are padded to 256-byte blocks before encryption,
+// hiding exact password lengths and rejecting invalid padding.
+func TestSecretPaddingHidesLengthAndRoundTripsBoundaries(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := NewMemoryStorage()
+	v, err := Create(ctx, store, []byte("padding-pass"), fastTestArgon2())
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer func() { _ = v.Close() }()
+
+	idShort, err := v.Put(ctx, EntryMeta{Title: "Short"}, Secret{Password: "a"})
+	if err != nil {
+		t.Fatalf("Put short: %v", err)
+	}
+	idMedium, err := v.Put(ctx, EntryMeta{Title: "Medium"}, Secret{
+		Password: strings.Repeat("p", 80),
+		Notes:    strings.Repeat("n", 80),
+	})
+	if err != nil {
+		t.Fatalf("Put medium: %v", err)
+	}
+
+	ctShort := len(v.entries[idShort].encryptedSecret)
+	ctMedium := len(v.entries[idMedium].encryptedSecret)
+	wantBlockCT := secretPadBlockSize + crypto.Overhead
+	if ctShort != wantBlockCT || ctMedium != wantBlockCT {
+		t.Fatalf("ciphertext sizes = (%d, %d), want both equal to %d", ctShort, ctMedium, wantBlockCT)
+	}
+
+	// Verify boundary sizes for padSecret / unpadSecret directly.
+	for _, size := range []int{0, 1, 127, 254, 255, 256, 257, 511, 512, 513} {
+		orig := bytes.Repeat([]byte{0x5A}, size)
+		padded := padSecret(orig)
+		if len(padded) == 0 || len(padded)%secretPadBlockSize != 0 {
+			t.Fatalf("size=%d: len(padded)=%d is not a positive multiple of %d", size, len(padded), secretPadBlockSize)
+		}
+		got, err := unpadSecret(padded)
+		if err != nil || !bytes.Equal(got, orig) {
+			t.Fatalf("size=%d: unpadSecret err=%v len(got)=%d", size, err, len(got))
+		}
+	}
+
+	// Invalid padding shapes must be rejected with ErrSecretCorrupted.
+	for _, bad := range [][]byte{
+		nil,
+		{},
+		make([]byte, secretPadBlockSize-1),
+		make([]byte, secretPadBlockSize), // all zeros, missing 0x80 marker
+		append(make([]byte, secretPadBlockSize-1), 0x01),
+	} {
+		if _, err := unpadSecret(bad); !errors.Is(err, ErrSecretCorrupted) {
+			t.Fatalf("unpadSecret(%x) err = %v, want ErrSecretCorrupted", bad, err)
+		}
+	}
+}
+
+// Audit Section 5: Open rejects corrupted inner VaultData entries (missing ID, duplicate ID,
+// zero version, invalid nonce length, truncated ciphertext, or malformed protobuf), and
+// entryAAD remains collision-free when EntryMeta.ID contains colons.
+func TestOpenRejectsMalformedInnerEntriesAndColonIDs(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := NewMemoryStorage()
+	pass := []byte("inner-validation-pass")
+
+	v, err := Create(ctx, store, pass, fastTestArgon2())
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Verify IDs containing colons cannot collide in entryAAD("item:1", 2) vs entryAAD("item", 12).
+	if _, err := v.Put(ctx, EntryMeta{ID: "item:1", Title: "Colon1"}, Secret{Password: "pw-colon"}); err != nil {
+		t.Fatalf("Put item:1 v1: %v", err)
+	}
+	if _, err := v.Put(ctx, EntryMeta{ID: "item:1", Title: "Colon1 v2"}, Secret{Password: "pw-colon-v2"}); err != nil {
+		t.Fatalf("Put item:1 v2: %v", err)
+	}
+	if _, err := v.Put(ctx, EntryMeta{ID: "item", Title: "Plain"}, Secret{Password: "pw-plain"}); err != nil {
+		t.Fatalf("Put item: %v", err)
+	}
+	// Advance "item" to version 12.
+	for i := 2; i <= 12; i++ {
+		if _, err := v.Put(ctx, EntryMeta{ID: "item", Title: "Plain"}, Secret{Password: fmt.Sprintf("pw-plain-v%d", i)}); err != nil {
+			t.Fatalf("Put item v%d: %v", i, err)
+		}
+	}
+	// Swapping their encrypted secrets in memory must fail AEAD authentication.
+	v.entries["item:1"].secretNonce, v.entries["item"].secretNonce = v.entries["item"].secretNonce, v.entries["item:1"].secretNonce
+	v.entries["item:1"].encryptedSecret, v.entries["item"].encryptedSecret = v.entries["item"].encryptedSecret, v.entries["item:1"].encryptedSecret
+	if _, err := v.GetSecret("item:1"); !errors.Is(err, ErrSecretCorrupted) {
+		t.Fatalf("swapped colon-ID GetSecret(item:1) err = %v, want ErrSecretCorrupted", err)
+	}
+	if _, err := v.GetSecret("item"); !errors.Is(err, ErrSecretCorrupted) {
+		t.Fatalf("swapped colon-ID GetSecret(item) err = %v, want ErrSecretCorrupted", err)
+	}
+
+	indexKey := testIndexKey(t, store, pass)
+	raw, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	hdrBytes := raw[:headerSize]
+	_ = v.Close()
+
+	validNonce := make([]byte, crypto.NonceSize)
+	validSecret := make([]byte, crypto.Overhead+secretPadBlockSize)
+
+	badVaults := map[string]*vaultpb.VaultData{
+		"missing_id": {
+			Version: 1,
+			Entries: []*vaultpb.Entry{{Id: "", Version: 1, SecretNonce: validNonce, EncryptedSecret: validSecret}},
+		},
+		"zero_version": {
+			Version: 1,
+			Entries: []*vaultpb.Entry{{Id: "e1", Version: 0, SecretNonce: validNonce, EncryptedSecret: validSecret}},
+		},
+		"bad_nonce_size": {
+			Version: 1,
+			Entries: []*vaultpb.Entry{{Id: "e1", Version: 1, SecretNonce: []byte("short"), EncryptedSecret: validSecret}},
+		},
+		"truncated_secret": {
+			Version: 1,
+			Entries: []*vaultpb.Entry{{Id: "e1", Version: 1, SecretNonce: validNonce, EncryptedSecret: []byte("short")}},
+		},
+		"duplicate_id": {
+			Version: 1,
+			Entries: []*vaultpb.Entry{
+				{Id: "dup", Version: 1, SecretNonce: validNonce, EncryptedSecret: validSecret},
+				{Id: "dup", Version: 1, SecretNonce: validNonce, EncryptedSecret: validSecret},
+			},
+		},
+	}
+
+	for name, pb := range badVaults {
+		t.Run(name, func(t *testing.T) {
+			plain, err := proto.Marshal(pb)
+			if err != nil {
+				t.Fatalf("proto.Marshal: %v", err)
+			}
+			nonce, ct, err := crypto.Encrypt(indexKey, plain, hdrBytes)
+			if err != nil {
+				t.Fatalf("Encrypt: %v", err)
+			}
+			s := NewMemoryStorage()
+			if err := s.Save(ctx, packEnvelope(hdrBytes, nonce, ct)); err != nil {
+				t.Fatalf("Save: %v", err)
+			}
+			if _, err := Open(ctx, s, pass); !errors.Is(err, ErrCorruptedVault) {
+				t.Fatalf("Open(%s) err = %v, want ErrCorruptedVault", name, err)
+			}
+		})
+	}
+
+	// Invalid protobuf bytes inside a validly authenticated outer envelope.
+	nonce, ct, err := crypto.Encrypt(indexKey, []byte{0xff, 0xff, 0xff, 0xff}, hdrBytes)
+	if err != nil {
+		t.Fatalf("Encrypt bad proto: %v", err)
+	}
+	badProtoStore := NewMemoryStorage()
+	if err := badProtoStore.Save(ctx, packEnvelope(hdrBytes, nonce, ct)); err != nil {
+		t.Fatalf("Save bad proto: %v", err)
+	}
+	if _, err := Open(ctx, badProtoStore, pass); !errors.Is(err, ErrCorruptedVault) {
+		t.Fatalf("Open(bad_protobuf) err = %v, want ErrCorruptedVault", err)
+	}
+}
+
+// FuzzUnpackEnvelope verifies that parsing arbitrary untrusted bytes never panics
+// and always enforces header format and Argon2id resource limits.
+func FuzzUnpackEnvelope(f *testing.F) {
+	limits := crypto.DefaultArgon2Limits()
+	f.Add([]byte{})
+	f.Add([]byte("PSDM"))
+	f.Add(header{Version: currentVersion, Params: DefaultArgon2Params()}.marshal())
+	f.Add(craftEnvelope(DefaultArgon2Params()))
+	f.Add(craftEnvelope(Argon2Params{Time: 100, MemoryKiB: 4 * 1024 * 1024, Threads: 255}))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		hdr, hdrBytes, nonce, ct, err := unpackEnvelope(data, limits)
+		if err != nil {
+			return
+		}
+		if len(hdrBytes) != headerSize || len(nonce) != crypto.NonceSize || len(ct) < crypto.Overhead {
+			t.Fatalf("unpackEnvelope returned invalid slice lengths: hdr=%d nonce=%d ct=%d", len(hdrBytes), len(nonce), len(ct))
+		}
+		if err := hdr.Params.validateLimits(limits); err != nil {
+			t.Fatalf("unpackEnvelope accepted header violating limits: %v", err)
+		}
+	})
+}
+
+// FuzzPadUnpadSecret verifies that padSecret/unpadSecret round-trip arbitrary payloads
+// and unpadSecret never panics on arbitrary corrupted slices.
+func FuzzPadUnpadSecret(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte{0x80})
+	f.Add([]byte{0x00})
+	f.Add(bytes.Repeat([]byte{0xAB}, 255))
+	f.Add(bytes.Repeat([]byte{0xCD}, 256))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		padded := padSecret(data)
+		got, err := unpadSecret(padded)
+		if err != nil {
+			t.Fatalf("unpadSecret(padSecret(data)) failed: %v", err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(data))
+		}
+		_, _ = unpadSecret(data)
+	})
 }
