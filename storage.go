@@ -13,13 +13,41 @@ import (
 	"sync"
 )
 
-// DefaultMaxFileSize is the default maximum vault size accepted by FileStorage.Load (64 MiB).
+// DefaultMaxFileSize is the default maximum serialized vault size in bytes (64 MiB)
+// accepted by FileStorage on both Load and Save operations when WithMaxFileSize is
+// not specified.
 const DefaultMaxFileSize int64 = 64 * 1024 * 1024
 
-// Storage defines the persistence backend for serialized encrypted vaults.
-// Implementations must be safe for concurrent use by multiple goroutines.
+// Storage defines the persistence backend contract for reading and writing serialized
+// encrypted vault envelopes.
+//
+// Implementations must be safe for concurrent use by multiple goroutines and must not
+// retain or mutate byte slices passed to Save after Save returns, nor mutate byte slices
+// returned from Load.
+//
+// In addition to Load and Save, a Storage implementation may optionally implement the
+// following method signatures to enable atomic existence checks, exclusive creation, and
+// optimistic concurrency control (both FileStorage and MemoryStorage implement all three):
+//   - Exists(ctx context.Context) (bool, error): checks whether a vault exists without
+//     loading the entire payload into memory.
+//   - SaveNew(ctx context.Context, data []byte) error: atomically persists data only if
+//     no vault currently exists, returning ErrAlreadyExists otherwise.
+//   - SaveIfMatch(ctx context.Context, data []byte, expectedDigest [32]byte) error:
+//     atomically persists data only if the currently stored vault bytes have SHA-256
+//     digest expectedDigest, returning ErrConcurrentModification otherwise.
 type Storage interface {
+	// Load retrieves the complete serialized encrypted vault envelope from the backend.
+	//
+	// Load must honor ctx cancellation and deadlines. If no vault exists in the backend
+	// yet, Load must return ErrNotFound (or an error wrapping ErrNotFound). The returned
+	// byte slice is owned by the caller and must not alias mutable internal state.
 	Load(ctx context.Context) ([]byte, error)
+
+	// Save atomically persists the serialized encrypted vault envelope data to the backend,
+	// replacing any previously stored vault data.
+	//
+	// Save must honor ctx cancellation and deadlines and must leave any previously stored
+	// vault intact if an error occurs. Implementations must not mutate data.
 	Save(ctx context.Context, data []byte) error
 }
 
@@ -49,26 +77,47 @@ const (
 	saveModeIfMatch
 )
 
-// FileStorageOption configures FileStorage.
+// FileStorageOption configures a FileStorage instance during construction in NewFileStorage.
+// Passing a nil FileStorageOption to NewFileStorage is safely ignored.
 type FileStorageOption func(*FileStorage)
 
-// WithMaxFileSize sets the maximum number of bytes FileStorage.Load will read.
+// WithMaxFileSize sets the maximum size in bytes that FileStorage will read on Load
+// or write on Save, SaveNew, and SaveIfMatch.
+//
+// Payloads exceeding maxBytes are rejected with ErrVaultTooLarge before reading the full
+// file or writing a temporary file to disk. Configuring a non-positive maxBytes (<= 0)
+// causes subsequent Load and Save operations on the FileStorage to fail with an error.
 func WithMaxFileSize(maxBytes int64) FileStorageOption {
 	return func(s *FileStorage) {
 		s.maxSize = maxBytes
 	}
 }
 
-// FileStorage persists the vault to a single file using atomic temporary-file
-// writes and 0600 file permissions.
+// FileStorage is a thread-safe Storage implementation that persists an encrypted vault
+// to a single regular file on the local filesystem.
+//
+// FileStorage enforces strict filesystem safety invariants:
+//   - Non-regular files (symbolic links, directories, FIFOs, sockets, and device nodes)
+//     are rejected via os.Lstat before opening or overwriting, and inode identity is
+//     re-verified with f.Stat and os.SameFile after opening to prevent TOCTOU swaps.
+//   - Writes are performed atomically via a temporary file created in the target directory
+//     with 0600 permissions, flushed to stable storage via Sync, and moved into place via
+//     os.Link (for exclusive creation in SaveNew) or os.Rename (for Save and SaveIfMatch),
+//     followed by a best-effort parent directory Sync.
+//   - Concurrent calls within the same process on the same FileStorage instance are
+//     serialized by an internal read-write mutex.
 type FileStorage struct {
 	mu      sync.RWMutex
 	path    string
 	maxSize int64
 }
 
-// NewFileStorage creates a FileStorage targeting path. By default Load rejects
-// files larger than DefaultMaxFileSize.
+// NewFileStorage constructs a FileStorage targeting the filesystem file at path.
+//
+// By default, NewFileStorage sets the maximum allowed file size to DefaultMaxFileSize
+// (64 MiB); supply WithMaxFileSize in opts to customize this limit. NewFileStorage
+// does not perform any disk I/O; path validation occurs on subsequent Load, Exists,
+// or Save calls.
 func NewFileStorage(path string, opts ...FileStorageOption) *FileStorage {
 	s := &FileStorage{path: path, maxSize: DefaultMaxFileSize}
 	for _, opt := range opts {
@@ -79,10 +128,17 @@ func NewFileStorage(path string, opts ...FileStorageOption) *FileStorage {
 	return s
 }
 
-// Load reads the vault file from disk. It returns ErrNotFound if the file does not
-// exist, ErrInvalidStorageFile if the path is not a regular file (symlinks, FIFOs,
-// devices, and directories are rejected before opening, so Load cannot block on them),
-// and ErrVaultTooLarge if the file exceeds the configured size limit.
+// Load reads and returns the encrypted vault file from disk at the FileStorage's path.
+//
+// Load checks ctx before and after acquiring the read lock, verifies via os.Lstat that
+// the target path is a regular file whose size does not exceed the configured maximum,
+// opens the file, re-verifies with f.Stat and os.SameFile that the path was not swapped
+// during open, and reads at most maxSize + 1 bytes.
+//
+// It returns ctx.Err() if ctx is canceled, an error if the configured path is empty or
+// maxSize <= 0, ErrNotFound if the file does not exist, ErrInvalidStorageFile if the
+// path is a symlink or other non-regular file (or changed during open), ErrVaultTooLarge
+// if the file size exceeds maxSize, or a wrapped I/O error.
 func (s *FileStorage) Load(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -143,8 +199,13 @@ func (s *FileStorage) Load(ctx context.Context) ([]byte, error) {
 	return data, nil
 }
 
-// Exists reports whether a regular vault file exists at s.path without reading its contents.
-// It returns ErrInvalidStorageFile if the path exists and is not a regular file.
+// Exists reports whether a regular vault file currently exists at the FileStorage's path
+// without reading the file's contents into memory.
+//
+// Exists returns (false, nil) when the path does not exist, (true, nil) when a regular
+// file exists at the path, ctx.Err() if ctx is canceled, an error if the path is empty,
+// ErrInvalidStorageFile if the path exists and is a symlink, directory, or other
+// non-regular file, or a wrapped filesystem stat error.
 func (s *FileStorage) Exists(ctx context.Context) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -173,22 +234,49 @@ func (s *FileStorage) Exists(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// Save atomically writes data to disk via a 0600 temporary file in the same
-// directory, fsyncing before renaming into place. It returns ErrInvalidStorageFile
-// if the target path exists and is not a regular file.
+// Save atomically writes data to the FileStorage's path, creating the file if it does
+// not exist or replacing the existing regular file.
+//
+// Save writes data to a temporary file in the same directory with 0600 permissions,
+// calls Sync and Close on the temporary file, renames it over the target path, and
+// performs a best-effort Sync on the parent directory. If any step fails or ctx is
+// canceled before the rename, the temporary file is removed and the existing file at
+// the target path is left untouched.
+//
+// Save returns ctx.Err() if ctx is canceled, an error if the path is empty or
+// maxSize <= 0, ErrVaultTooLarge if len(data) exceeds maxSize, ErrInvalidStorageFile
+// if the target path exists and is not a regular file, or a wrapped I/O error.
 func (s *FileStorage) Save(ctx context.Context, data []byte) error {
 	return s.save(ctx, data, saveModeOverwrite, [32]byte{})
 }
 
-// SaveNew atomically writes data to disk only if no file currently exists at s.path,
-// returning ErrAlreadyExists if a regular file is already present or ErrInvalidStorageFile
-// if the path is a symlink or other non-regular file.
+// SaveNew atomically writes data to the FileStorage's path only if no file currently
+// exists at that path.
+//
+// SaveNew writes and syncs a 0600 temporary file in the target directory and uses
+// os.Link to link it into place atomically without overwriting existing files,
+// removing the temporary link afterwards.
+//
+// SaveNew returns ErrAlreadyExists if a regular file already exists at the target path,
+// ErrInvalidStorageFile if the path exists as a symlink, directory, or other non-regular
+// file, ErrVaultTooLarge if len(data) exceeds maxSize, ctx.Err() if ctx is canceled,
+// or a wrapped I/O error.
 func (s *FileStorage) SaveNew(ctx context.Context, data []byte) error {
 	return s.save(ctx, data, saveModeExclusive, [32]byte{})
 }
 
-// SaveIfMatch atomically writes data to disk only if the existing regular file at s.path
-// still has SHA-256 digest expectedDigest, returning ErrConcurrentModification otherwise.
+// SaveIfMatch atomically writes data to the FileStorage's path only if the existing
+// regular file on disk still has the SHA-256 digest expectedDigest.
+//
+// SaveIfMatch verifies the existing file's inode and SHA-256 digest while holding the
+// FileStorage write lock both before creating the 0600 temporary file and immediately
+// before renaming the synced temporary file over the target path.
+//
+// SaveIfMatch returns ErrConcurrentModification if the target file does not exist,
+// exceeds maxSize on disk, changed inode, or has a SHA-256 digest different from
+// expectedDigest. It returns ErrVaultTooLarge if len(data) exceeds maxSize,
+// ErrInvalidStorageFile if the target path is not a regular file, ctx.Err() if ctx is
+// canceled, or a wrapped I/O error.
 func (s *FileStorage) SaveIfMatch(ctx context.Context, data []byte, expectedDigest [32]byte) error {
 	return s.save(ctx, data, saveModeIfMatch, expectedDigest)
 }
@@ -397,22 +485,30 @@ func (s *FileStorage) save(ctx context.Context, data []byte, mode fileSaveMode, 
 	return nil
 }
 
-// MemoryStorage is a thread-safe in-memory Storage implementation intended for tests
-// and ephemeral vaults.
+// MemoryStorage is a thread-safe in-memory Storage implementation intended for unit tests,
+// ephemeral vaults, and byte-slice import/export workflows.
+//
+// MemoryStorage clones all byte slices on input and output so callers cannot mutate the
+// stored ciphertext envelope out-of-band, and implements Exists, SaveNew, and SaveIfMatch
+// for full parity with FileStorage.
 type MemoryStorage struct {
 	mu     sync.RWMutex
 	exists bool
 	data   []byte
 }
 
-// NewMemoryStorage returns an empty MemoryStorage.
+// NewMemoryStorage constructs an empty, uninitialized MemoryStorage instance for which
+// Load initially returns ErrNotFound and Exists returns (false, nil).
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{}
 }
 
-// NewMemoryStorageWithData returns a MemoryStorage pre-populated with a defensive copy
-// of data. This is useful when importing or opening an encrypted vault byte slice
-// received from a mobile file picker, clipboard, or network stream.
+// NewMemoryStorageWithData constructs a MemoryStorage pre-populated with a defensive
+// copy of data and marked as existing (even if data is nil or empty).
+//
+// This constructor is useful when opening or importing an encrypted vault byte slice
+// received in memory from a mobile file picker, clipboard, database blob, or network stream.
+// Subsequent mutations to the caller's data slice do not affect the returned MemoryStorage.
 func NewMemoryStorageWithData(data []byte) *MemoryStorage {
 	return &MemoryStorage{
 		exists: true,
@@ -446,7 +542,11 @@ func sameStorage(a, b Storage) bool {
 	return false
 }
 
-// Exists reports whether any vault data has been saved in memory.
+// Exists reports whether vault data has been persisted in m.
+//
+// Exists honors ctx cancellation and returns (false, ctx.Err()) if ctx is already done;
+// otherwise it returns (true, nil) if m was initialized via NewMemoryStorageWithData or
+// a prior Save/SaveNew call, or (false, nil) if m is empty.
 func (m *MemoryStorage) Exists(ctx context.Context) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -461,7 +561,10 @@ func (m *MemoryStorage) Exists(ctx context.Context) (bool, error) {
 	return m.exists, nil
 }
 
-// Load returns a copy of the stored vault bytes, or ErrNotFound if nothing has been saved.
+// Load returns a defensive copy of the encrypted vault bytes stored in m.
+//
+// Load returns ctx.Err() if ctx is canceled, or ErrNotFound if no vault data has been
+// stored in m yet. Mutating the returned slice does not affect m's internal buffer.
 func (m *MemoryStorage) Load(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -479,7 +582,10 @@ func (m *MemoryStorage) Load(ctx context.Context) ([]byte, error) {
 	return bytes.Clone(m.data), nil
 }
 
-// Save stores a defensive copy of data in memory.
+// Save stores a defensive copy of data in m, overwriting any previously stored bytes
+// and marking m as populated.
+//
+// Save returns ctx.Err() without modifying m if ctx is canceled.
 func (m *MemoryStorage) Save(ctx context.Context, data []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -496,8 +602,11 @@ func (m *MemoryStorage) Save(ctx context.Context, data []byte) error {
 	return nil
 }
 
-// SaveNew stores a defensive copy of data only if the MemoryStorage is currently empty,
-// returning ErrAlreadyExists otherwise.
+// SaveNew atomically stores a defensive copy of data in m only if m does not currently
+// hold any vault data.
+//
+// SaveNew returns ctx.Err() if ctx is canceled, or ErrAlreadyExists without modifying
+// the stored bytes if m is already populated.
 func (m *MemoryStorage) SaveNew(ctx context.Context, data []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -517,8 +626,12 @@ func (m *MemoryStorage) SaveNew(ctx context.Context, data []byte) error {
 	return nil
 }
 
-// SaveIfMatch atomically replaces the stored bytes only if their current SHA-256 digest
-// equals expectedDigest, returning ErrConcurrentModification otherwise.
+// SaveIfMatch atomically replaces the bytes stored in m with a defensive copy of data
+// only if m is currently populated and the SHA-256 digest of its stored bytes equals
+// expectedDigest.
+//
+// SaveIfMatch returns ctx.Err() if ctx is canceled, or ErrConcurrentModification without
+// modifying m if m is empty or its current SHA-256 digest differs from expectedDigest.
 func (m *MemoryStorage) SaveIfMatch(ctx context.Context, data []byte, expectedDigest [32]byte) error {
 	if err := ctx.Err(); err != nil {
 		return err

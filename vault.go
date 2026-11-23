@@ -1,3 +1,18 @@
+// Package passwordium provides a single-file, minimized-RAM-exposure encrypted
+// credential vault for storing passwords, secrets, and searchable entry metadata.
+//
+// A vault envelope consists of a 50-byte plaintext binary header (4-byte "PSDM" magic,
+// uint16 format version, 32-byte Argon2id salt, and uint32 Time/MemoryKiB/Threads costs),
+// a 24-byte outer XChaCha20-Poly1305 nonce, and an authenticated ciphertext containing
+// the protobuf-encoded VaultData index with the 50-byte header bound as associated data (AAD).
+//
+// Key derivation follows a two-level hierarchy: Argon2id derives a 32-byte masterKey
+// from the caller's master password and header salt, and HKDF-SHA256 expands masterKey
+// into two domain-separated 32-byte subkeys (indexKey for the outer VaultData container
+// and secretKey for individual entry Secret payloads). Raw key buffers are wiped via
+// clear() immediately after initializing the session AEAD instances, and each entry's
+// SecretPayload (padded to 256-byte ISO/IEC 7816-4 blocks and bound to "<entry_id>:<entry_version>"
+// as AAD) remains encrypted in memory until Vault.GetSecret is called.
 package passwordium
 
 import (
@@ -34,11 +49,20 @@ const (
 )
 
 // Vault is a thread-safe encrypted credential store backed by a Storage implementation.
-// Entry metadata is kept indexed in memory after Open for fast search, while each
-// entry's SecretPayload remains encrypted in memory until GetSecret is called.
 //
-// The master key and raw subkeys are wiped immediately after key derivation; only
-// the initialized AEAD instances for indexKey and secretKey are retained for the session.
+// After Create or Open returns, searchable entry metadata (EntryMeta) is indexed in
+// memory for fast lookups via Vault.GetMeta and Vault.Search, while each entry's
+// SecretPayload remains individually encrypted under secretKey in memory until
+// Vault.GetSecret is called.
+//
+// The 32-byte master key and raw HKDF subkeys are wiped immediately after key derivation;
+// only the initialized XChaCha20-Poly1305 AEAD instances for indexKey and secretKey
+// are retained for the session and released when Vault.Close or Vault.CloseWithSave completes.
+//
+// All methods on Vault are safe for concurrent use by multiple goroutines. Unless
+// WithAutoSave(true) is configured, in-memory mutations (Vault.Put, Vault.Delete,
+// Vault.DeleteContext, and Vault.Import) mark the Vault as dirty without writing to
+// Storage until Vault.Save or Vault.CloseWithSave is called.
 type Vault struct {
 	mu           sync.RWMutex
 	store        Storage
@@ -264,14 +288,28 @@ func deriveVaultCiphers(masterPassword, salt []byte, params Argon2Params) (index
 	return indexCipher, secretCipher, nil
 }
 
-// Create initializes a brand-new encrypted vault with a fresh random salt,
-// derives keys from masterPassword using Argon2id + HKDF-SHA256, and immediately
-// saves the empty vault to store. Create refuses to replace an existing vault
-// (returning ErrAlreadyExists) unless WithOverwrite(true) is supplied, and rejects
-// Argon2id memory costs below 16 MiB or parameters exceeding DefaultMaxArgon2Params.
+// Create initializes a brand-new encrypted Vault backed by store, derives session
+// AEAD keys from masterPassword and a freshly generated 32-byte random salt using
+// Argon2id and HKDF-SHA256, and immediately persists the initial empty vault (at
+// container version 1) to store.
 //
-// Create does not mutate masterPassword; callers should zero masterPassword
-// (for example, via clear(masterPassword)) once it is no longer needed.
+// By default, Create uses DefaultArgon2Params (Time=3, Memory=64 MiB, Threads=2),
+// disables automatic saving on subsequent mutations, and refuses to overwrite an
+// existing vault in store.
+//
+// Create does not mutate masterPassword; callers should zero masterPassword (for
+// example, via clear(masterPassword)) once it is no longer needed.
+//
+// Create returns:
+//   - ctx.Err() if ctx is canceled before or during initialization,
+//   - ErrNilStorage if store is nil,
+//   - ErrEmptyPassword if len(masterPassword) == 0,
+//   - ErrInvalidArgon2Params if WithArgon2Params specifies a memory cost below 16 MiB
+//     (16,384 KiB) or parameters exceeding DefaultMaxArgon2Params,
+//   - ErrAlreadyExists if a vault already exists in store and WithOverwrite(true) is not set,
+//   - ErrInvalidStorageFile or ErrVaultTooLarge if store is a FileStorage and path or
+//     size constraints are violated, or
+//   - a wrapped cryptographic or storage I/O error.
 func Create(ctx context.Context, store Storage, masterPassword []byte, opts ...CreateOption) (*Vault, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -358,15 +396,36 @@ func checkStorageNotExists(ctx context.Context, store Storage) error {
 	}
 }
 
-// Open loads an existing vault from store, enforces resource limits on the
-// plaintext header's Argon2id parameters (DefaultMaxArgon2Params, or the bounds
-// given via WithMaxArgon2Params / WithMaxArgon2Work) before running any key derivation,
-// derives keys from masterPassword, and decrypts the VaultData container index with
-// the header as AAD. Individual entry secrets remain encrypted in memory until
-// GetSecret is called.
+// Open loads an existing encrypted vault envelope from store, validates the 50-byte
+// plaintext header and enforces pre-KDF resource caps on its Argon2id parameters
+// (DefaultMaxArgon2Params by default, or custom bounds configured via WithMaxArgon2Params
+// and WithMaxArgon2Work), derives session keys from masterPassword, and authenticates
+// and decrypts the outer VaultData index using the 50-byte header as associated data (AAD).
 //
-// Open does not mutate masterPassword; callers should zero masterPassword
-// (for example, via clear(masterPassword)) once it is no longer needed.
+// After Open succeeds, entry metadata is indexed in memory and the SHA-256 digest of
+// the loaded envelope is recorded for optimistic concurrency checks on subsequent saves,
+// while individual entry Secret payloads remain encrypted in memory until Vault.GetSecret
+// is invoked.
+//
+// Open does not mutate masterPassword; callers should zero masterPassword (for example,
+// via clear(masterPassword)) once it is no longer needed.
+//
+// Open returns:
+//   - ctx.Err() if ctx is canceled before or during key derivation,
+//   - ErrNilStorage if store is nil,
+//   - ErrNotFound if no vault exists in store,
+//   - ErrInvalidStorageFile or ErrVaultTooLarge if store is a FileStorage and the file
+//     is non-regular or exceeds the configured maximum file size,
+//   - ErrInvalidHeader if the envelope has fewer than 50 bytes or lacks the "PSDM" magic,
+//   - ErrUnsupportedVersion if the header format version is not 1,
+//   - ErrInvalidArgon2Params if the header's Argon2id parameters or the caller's
+//     WithMaxArgon2Params bounds are invalid or exceed configured resource limits,
+//   - ErrCorruptedVault if the envelope is shorter than 90 bytes, the outer decrypted
+//     VaultData protobuf is malformed, the container version is 0 or math.MaxUint64,
+//     or any entry has an empty/duplicate ID, version 0 or math.MaxUint64, an invalid
+//     24-byte secret nonce, or an unaligned encrypted secret size, or
+//   - ErrInvalidPassword if outer XChaCha20-Poly1305 AEAD verification fails (wrong
+//     master password or tampered header/ciphertext).
 func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...OpenOption) (*Vault, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -500,9 +559,29 @@ func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...Ope
 	}, nil
 }
 
-// Put creates a new entry (generating a UUIDv4 when meta.ID is empty) or updates
-// an existing entry (incrementing its version). Secret is encrypted immediately
-// with secretKey using "<entry_id>:<entry_version>" as associated data.
+// Put creates a new entry in v (generating a random RFC 4122 UUIDv4 when meta.ID is
+// empty) or updates an existing entry in v when meta.ID matches an existing record,
+// returning the entry's effective ID.
+//
+// Put validates that all string fields in meta and secret contain valid UTF-8, serializes
+// secret into a protobuf SecretPayload, pads the plaintext to a multiple of 256 bytes
+// using ISO/IEC 7816-4 padding, encrypts it under secretKey with a fresh 24-byte random
+// nonce and "<id>:<version>" as associated data, and zeroes all temporary plaintext and
+// padded byte buffers before returning.
+//
+// When creating a new entry, Version is initialized to 1 and both CreatedAt and UpdatedAt
+// are set to the current UTC Unix timestamp (in seconds). When updating an existing entry,
+// Version is incremented by 1, CreatedAt is preserved, UpdatedAt is set to at least the
+// current UTC Unix timestamp (never regressing below CreatedAt or the previous UpdatedAt),
+// and the previous entry record's encrypted secret buffer is wiped once the update succeeds.
+//
+// Unless WithAutoSave(true) is enabled on v, Put only updates v's in-memory index and
+// marks v as dirty; when WithAutoSave(true) is enabled, Put immediately persists the
+// vault to Storage and atomically rolls back the in-memory change if saving fails.
+//
+// Put returns ctx.Err() if ctx is canceled, ErrVaultClosed if v is closed, an error if
+// any field in meta or secret contains invalid UTF-8, ErrCorruptedVault if incrementing
+// the entry version would overflow uint64, or a storage error if WithAutoSave persistence fails.
 func (v *Vault) Put(ctx context.Context, meta EntryMeta, secret Secret) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -606,7 +685,12 @@ func (v *Vault) Put(ctx context.Context, meta EntryMeta, secret Secret) (string,
 	return id, nil
 }
 
-// GetMeta returns the metadata for entry id without decrypting its secret.
+// GetMeta returns a copy of the EntryMeta for the entry identified by id from v's
+// in-memory index without decrypting the entry's Secret payload.
+//
+// The returned EntryMeta contains a freshly cloned Tags slice, so mutating it does
+// not affect v. GetMeta returns ErrVaultClosed if v has been closed, or ErrEntryNotFound
+// if no entry with id exists in v.
 func (v *Vault) GetMeta(id string) (EntryMeta, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -622,8 +706,18 @@ func (v *Vault) GetMeta(id string) (EntryMeta, error) {
 	return rec.toMeta(), nil
 }
 
-// GetSecret decrypts and returns the Secret for entry id. The returned
+// GetSecret authenticates, decrypts, unpads, and unmarshals the Secret payload for
+// the entry identified by id.
+//
+// GetSecret verifies the entry's XChaCha20-Poly1305 authentication tag against
+// "<id>:<version>" as associated data (detecting any cross-entry swap or version
+// rollback), removes ISO/IEC 7816-4 padding, unmarshals the SecretPayload protobuf,
+// and wipes the temporary decrypted byte buffer before returning. The returned
 // CustomFields map is freshly allocated and owned by the caller.
+//
+// GetSecret returns ErrVaultClosed if v has been closed, ErrEntryNotFound if id does
+// not exist in v, or ErrSecretCorrupted if AEAD verification, unpadding, or protobuf
+// decoding fails.
 func (v *Vault) GetSecret(id string) (Secret, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -661,16 +755,32 @@ func (v *Vault) GetSecret(id string) (Secret, error) {
 	}, nil
 }
 
-// Delete removes entry id from the vault. It is equivalent to
-// DeleteContext(context.Background(), id); prefer DeleteContext when
-// WithAutoSave is enabled and Storage may block.
+// Delete removes the entry identified by id from v and zeroes its in-memory encrypted
+// secret buffer.
+//
+// Delete is a shorthand for v.DeleteContext(context.Background(), id). Prefer
+// Vault.DeleteContext when WithAutoSave(true) is enabled and the underlying Storage
+// may block or require deadline propagation.
+//
+// Delete returns ErrVaultClosed if v is closed, ErrEntryNotFound if id does not exist
+// in v, or a storage error if WithAutoSave(true) persistence fails (in which case the
+// deletion is rolled back in memory).
 func (v *Vault) Delete(id string) error {
 	return v.DeleteContext(context.Background(), id)
 }
 
-// DeleteContext removes entry id from the vault. When WithAutoSave is enabled,
-// ctx is propagated to Storage.Save so deadlines and cancellation are honored;
-// on save failure the deletion is rolled back.
+// DeleteContext removes the entry identified by id from v, honoring ctx cancellation
+// and deadlines, and zeroes the removed entry's in-memory encrypted secret buffer.
+//
+// When WithAutoSave(true) is enabled on v, DeleteContext immediately persists the
+// updated vault to Storage using ctx; if saving fails, the entry and v's previous
+// dirty state are atomically restored in memory and the entry's secret buffer is
+// preserved. When WithAutoSave is disabled, DeleteContext marks v as dirty without
+// performing storage I/O.
+//
+// DeleteContext returns ctx.Err() if ctx is canceled, ErrVaultClosed if v is closed,
+// ErrEntryNotFound if id does not exist in v, or any error returned by Storage during
+// auto-save.
 func (v *Vault) DeleteContext(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -707,9 +817,18 @@ func (v *Vault) DeleteContext(ctx context.Context, id string) error {
 	return nil
 }
 
-// Search performs a case-insensitive in-memory search over entry metadata
-// matching query.Query as a substring of Title, Username, or URL, and requiring
-// all tags listed in query.Tags. Results are returned sorted deterministically.
+// Search filters v's in-memory EntryMeta index against query without decrypting any
+// entry secrets and returns a deterministically sorted slice of matching EntryMeta copies.
+//
+// An entry matches query if:
+//  1. query.Query is empty, or query.Query appears as a case-insensitive substring of
+//     the entry's Title, Username, or URL; and
+//  2. query.Tags is empty, or the entry contains every tag in query.Tags (matched
+//     case-insensitively for exact tag equality).
+//
+// Matching entries are sorted in ascending order by case-folded Title, then exact
+// Title, and finally ID. Each returned EntryMeta has a defensive copy of its Tags slice.
+// If v is closed, Search returns nil.
 func (v *Vault) Search(query SearchQuery) []EntryMeta {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -764,8 +883,23 @@ func hasAllTags(entryTags, required []string) bool {
 	return true
 }
 
-// Save serializes the vault index, encrypts it with indexKey using a fresh nonce
-// and the 50-byte plaintext header as AAD, and persists the envelope via Storage.
+// Save increments v's container version, serializes all entries into a VaultData
+// protobuf (wiping the temporary plaintext buffer afterwards), encrypts the container
+// under indexKey with a fresh 24-byte random nonce and the 50-byte plaintext header
+// as associated data, and persists the resulting envelope to v's backing Storage.
+//
+// When the backing Storage implements conditional saving (such as FileStorage and
+// MemoryStorage), Save verifies that the currently stored bytes still match the
+// SHA-256 digest from when v was opened or last saved, preventing silent lost updates
+// across concurrent sessions. Upon a successful write, Save updates v's container
+// Version, UpdatedAt timestamp, and stored digest, and clears the Dirty flag. If
+// saving fails, v's in-memory state, Version, and Dirty flag remain unchanged.
+//
+// Save returns ctx.Err() if ctx is canceled, ErrVaultClosed if v is closed,
+// ErrCorruptedVault if incrementing the container version would overflow uint64,
+// ErrConcurrentModification if the underlying Storage was modified out-of-band,
+// ErrVaultTooLarge or ErrInvalidStorageFile for FileStorage constraint violations,
+// or a wrapped I/O error.
 func (v *Vault) Save(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -784,19 +918,33 @@ func (v *Vault) Save(ctx context.Context) error {
 	return v.saveLocked(ctx)
 }
 
-// Export writes a complete encrypted snapshot of the vault's current in-memory state
-// to dst without modifying the active Vault's dirty state, version, or backing Storage.
+// Export writes a complete, self-contained encrypted snapshot of v's current in-memory
+// state (including any unsaved modifications) to dst without modifying v's dirty state,
+// container version, or backing Storage.
 //
 // By default:
 //   - Export refuses to overwrite an existing vault in dst (returning ErrAlreadyExists)
 //     unless WithOverwrite(true) is provided.
-//   - Export seals the snapshot using the active vault's header parameters and key
-//     hierarchy (with a fresh 24-byte outer nonce), without decrypting entry secrets.
+//   - Export seals the snapshot using v's existing header parameters and key hierarchy
+//     (with a fresh 24-byte outer nonce), without decrypting individual entry secrets.
 //
 // When WithExportPassword(newPassword) is supplied (optionally combined with
-// WithArgon2Params), Export generates a fresh 32-byte random salt, derives a new
-// key hierarchy, and re-encrypts every entry's padded secret payload in place
-// (wiping each temporary byte buffer immediately without allocating Go strings).
+// WithArgon2Params), Export generates a fresh 32-byte random salt, derives a new key
+// hierarchy outside v's lock, and re-encrypts every entry's padded SecretPayload in
+// place (verifying AEAD tags, padding, and protobuf UTF-8 wire validity while wiping
+// each temporary byte buffer immediately without allocating Go strings).
+//
+// Export returns:
+//   - ctx.Err() if ctx is canceled,
+//   - ErrNilStorage if dst is nil,
+//   - ErrVaultClosed if v is closed,
+//   - ErrSameStorage if dst refers to the same Storage instance or file as v's store,
+//   - ErrEmptyPassword if WithExportPassword is given an empty slice or WithArgon2Params
+//     is provided without WithExportPassword,
+//   - ErrInvalidArgon2Params if custom Argon2id parameters violate creation bounds,
+//   - ErrAlreadyExists if dst already contains a vault and WithOverwrite(true) is not set,
+//   - ErrSecretCorrupted if re-keying encounters a corrupted entry secret in v, or
+//   - a storage I/O error from dst.
 func (v *Vault) Export(ctx context.Context, dst Storage, opts ...ExportOption) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -974,15 +1122,37 @@ func (v *Vault) Export(ctx context.Context, dst Storage, opts ...ExportOption) e
 }
 
 // Import opens and authenticates an external encrypted vault from src using srcPassword,
-// verifies and re-encrypts its entry secrets under the active vault's secretKey without
+// verifies and re-encrypts every entry's padded SecretPayload under v's secretKey without
 // allocating Go strings for secret payloads, and merges the entries into v according to
-// ConflictPolicy (defaulting to ConflictKeepNewer).
+// the configured ConflictPolicy (defaulting to ConflictKeepNewer).
 //
-// Import is atomic: if any entry in src fails authentication or validation, or if
-// WithAutoSave persistence fails, v remains unchanged.
+// Import enforces pre-KDF Argon2id resource limits on src's header (configurable via
+// WithMaxArgon2Params and WithMaxArgon2Work) and performs the source vault KDF outside
+// v's write lock. Every source entry's secret is decrypted, unpadded, and validated at
+// the protobuf wire level (including UTF-8 validation) before any entry in v is modified,
+// ensuring corrupted source entries are never silently ignored even if they would be
+// skipped by the conflict policy.
 //
-// Import does not mutate srcPassword; callers should zero srcPassword
-// (for example, via clear(srcPassword)) once it is no longer needed.
+// Import is atomic: if any entry in src fails authentication, wire validation, or version
+// overflow checks, or if WithAutoSave(true) persistence fails, v's in-memory entries and
+// dirty state remain completely unchanged. When staged entries are added or updated, v is
+// marked dirty (or saved immediately when WithAutoSave(true) is enabled); if all source
+// entries are skipped, v's dirty state is left untouched.
+//
+// Import does not mutate srcPassword; callers should zero srcPassword (for example, via
+// clear(srcPassword)) once Import returns.
+//
+// Import returns an ImportResult with Added, Updated, and Skipped counts, or an error:
+//   - ctx.Err() if ctx is canceled,
+//   - ErrNilStorage if src is nil,
+//   - ErrInvalidConflictPolicy if WithConflictPolicy specifies an invalid policy,
+//   - ErrVaultClosed if v is closed,
+//   - ErrSameStorage if src refers to the same Storage instance or file as v's store,
+//   - any header, limit, password, or format error returned by Open on src,
+//   - ErrSecretCorrupted if any entry secret in src fails AEAD verification, unpadding,
+//     or protobuf wire/UTF-8 validation,
+//   - ErrCorruptedVault if merging a conflicting entry's version would overflow uint64, or
+//   - any storage error if WithAutoSave(true) persistence fails.
 func (v *Vault) Import(ctx context.Context, src Storage, srcPassword []byte, opts ...ImportOption) (ImportResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ImportResult{}, err
@@ -1301,11 +1471,15 @@ func (v *Vault) saveLocked(ctx context.Context) error {
 	return nil
 }
 
-// Close releases the session AEAD instances, zeroes all encrypted entry secrets
-// in memory, clears the in-memory entry map, and prevents further operations on
-// the Vault. Any unsaved in-memory modifications (Dirty() == true) are discarded
-// without writing to Storage; call Save before Close, use CloseWithSave, or enable
-// WithAutoSave to persist changes. Calling Close multiple times is safe and idempotent.
+// Close releases v's session AEAD instances (indexCipher and secretCipher), zeroes all
+// in-memory encrypted entry secrets and nonces via clear(), empties the entry index map,
+// clears the stored concurrency digest, and marks v as closed so subsequent operations
+// fail with ErrVaultClosed.
+//
+// Close does not perform any Storage I/O; any unsaved in-memory modifications
+// (when Vault.Dirty reports true) are discarded. Call Vault.Save before Close, use
+// Vault.CloseWithSave, or configure WithAutoSave(true) to persist changes.
+// Calling Close multiple times is safe and idempotent, and always returns nil.
 func (v *Vault) Close() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -1314,10 +1488,17 @@ func (v *Vault) Close() error {
 	return nil
 }
 
-// CloseWithSave persists any unsaved in-memory modifications (when Dirty() is true)
-// to Storage before closing and wiping the Vault. If saving fails, the Vault remains
-// open and retains its in-memory state so the caller can retry or recover.
-// Calling CloseWithSave on an already-closed Vault is a no-op and returns nil.
+// CloseWithSave atomically persists any unsaved in-memory modifications (when Vault.Dirty
+// is true) to v's backing Storage before closing and wiping v as described in Vault.Close.
+//
+// If v is not dirty, CloseWithSave closes and wipes v without writing to Storage.
+// If v is already closed, CloseWithSave is a no-op and returns nil (unless ctx is
+// already canceled, in which case ctx.Err() is returned).
+//
+// If saving to Storage fails (for example, due to I/O failure, context cancellation,
+// ErrVaultTooLarge, or ErrConcurrentModification), CloseWithSave aborts the close and
+// leaves v open with its in-memory entries and dirty state intact so the caller can
+// retry, export a backup snapshot via Vault.Export, or inspect the unsaved state.
 func (v *Vault) CloseWithSave(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1359,14 +1540,20 @@ func (v *Vault) closeLocked() {
 	v.closed = true
 }
 
-// Dirty reports whether the vault has unsaved in-memory modifications.
+// Dirty reports whether v currently has in-memory entry modifications (from Vault.Put,
+// Vault.Delete, Vault.DeleteContext, or Vault.Import) that have not yet been persisted
+// to Storage.
+//
+// Dirty returns false for a newly created or freshly opened Vault, immediately after
+// a successful Vault.Save or auto-saved mutation, and after v has been closed.
 func (v *Vault) Dirty() bool {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	return !v.closed && v.dirty
 }
 
-// Len returns the number of entries currently stored in the vault.
+// Len returns the number of entries currently stored in v's in-memory index, or 0 if
+// v has been closed.
 func (v *Vault) Len() int {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -1376,8 +1563,14 @@ func (v *Vault) Len() int {
 	return len(v.entries)
 }
 
-// Version returns the current persisted container version of the vault, or 0 if closed.
-// Callers can record Version externally to detect whole-file rollback of the storage backend.
+// Version returns the monotonically increasing container version of v as last persisted
+// to or loaded from Storage (starting at 1 when created by Create and incrementing by 1
+// on each successful Save), or 0 if v has been closed.
+//
+// In-memory mutations that have not yet been saved do not increment Version until
+// Vault.Save, Vault.CloseWithSave, or an auto-saved mutation succeeds. Callers can
+// record Version in external trusted metadata to detect whole-file rollback attacks
+// on the underlying Storage backend.
 func (v *Vault) Version() uint64 {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -1387,8 +1580,9 @@ func (v *Vault) Version() uint64 {
 	return v.version
 }
 
-// UpdatedAt returns the UTC timestamp of the vault's last persisted state (or initial creation),
-// or the zero time.Time if the vault is closed.
+// UpdatedAt returns the UTC timestamp (at 1-second Unix resolution) of v's last
+// persisted state (updated on Create and on each successful Save), or the zero
+// time.Time value if v has been closed.
 func (v *Vault) UpdatedAt() time.Time {
 	v.mu.RLock()
 	defer v.mu.RUnlock()

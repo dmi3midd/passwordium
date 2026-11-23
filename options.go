@@ -1,40 +1,51 @@
 package passwordium
 
-// CreateOption configures Create. Options that only make sense for Open
-// (such as WithMaxArgon2Params) do not implement CreateOption and are rejected at compile time.
+// CreateOption configures vault creation in Create.
+//
+// Options that only apply to opening an existing vault (such as WithMaxArgon2Params
+// or WithMaxArgon2Work) do not implement CreateOption and are rejected at compile time.
+// Passing a nil CreateOption to Create is safely ignored.
 type CreateOption interface {
 	applyCreate(*createConfig)
 }
 
-// OpenOption configures Open. Options that only make sense for Create
-// (such as WithArgon2Params or WithOverwrite) do not implement OpenOption and are rejected at compile time.
+// OpenOption configures vault loading and pre-KDF resource limits in Open.
+//
+// Options that only apply to creating or exporting a vault (such as WithArgon2Params
+// or WithOverwrite) do not implement OpenOption and are rejected at compile time.
+// Passing a nil OpenOption to Open is safely ignored.
 type OpenOption interface {
 	applyOpen(*openConfig)
 }
 
-// CreateOpenOption is an option accepted by both Create and Open.
+// CreateOpenOption is a composite option interface implemented by options that are
+// valid for both Create and Open (such as WithAutoSave).
 type CreateOpenOption interface {
 	CreateOption
 	OpenOption
 }
 
-// ExportOption configures Vault.Export.
+// ExportOption configures snapshot creation and optional re-keying in Vault.Export.
+// Passing a nil ExportOption to Vault.Export is safely ignored.
 type ExportOption interface {
 	applyExport(*exportConfig)
 }
 
-// CreateExportOption is an option accepted by both Create and Vault.Export.
+// CreateExportOption is a composite option interface implemented by options that are
+// valid for both Create and Vault.Export (such as WithArgon2Params and WithOverwrite).
 type CreateExportOption interface {
 	CreateOption
 	ExportOption
 }
 
-// ImportOption configures Vault.Import.
+// ImportOption configures conflict resolution and pre-KDF source header limits in Vault.Import.
+// Passing a nil ImportOption to Vault.Import is safely ignored.
 type ImportOption interface {
 	applyImport(*importConfig)
 }
 
-// OpenImportOption is an option accepted by both Open and Vault.Import.
+// OpenImportOption is a composite option interface implemented by options that are
+// valid for both Open and Vault.Import (such as WithMaxArgon2Params and WithMaxArgon2Work).
 type OpenImportOption interface {
 	OpenOption
 	ImportOption
@@ -135,11 +146,20 @@ func (o maxArgon2WorkOption) applyImport(cfg *importConfig) {
 	cfg.openOpts = append(cfg.openOpts, o)
 }
 
-// WithArgon2Params overrides the default Argon2id parameters when creating or re-keying
-// an exported vault. Create and Export reject parameters with MemoryKiB below 16 MiB
-// (16384 KiB) or exceeding DefaultMaxArgon2Params limits (Time=16, Memory=512 MiB,
-// Threads=16, Time*Memory<=2 GiB-passes). When passed to Vault.Export, WithExportPassword
-// must also be provided. Use Argon2ParamsMiB to avoid KiB/MiB unit mistakes.
+// WithArgon2Params overrides the default Argon2id parameters (DefaultArgon2Params)
+// when creating a vault with Create or re-keying an exported vault with Vault.Export.
+//
+// Create and Vault.Export validate params before running key derivation and return
+// ErrInvalidArgon2Params if:
+//   - params.MemoryKiB is below the creation floor of 16 MiB (16,384 KiB),
+//   - params.Time, params.MemoryKiB, or params.Threads is zero or exceeds DefaultMaxArgon2Params
+//     (Time=16, Memory=512 MiB, Threads=16), or
+//   - uint64(params.Time) * uint64(params.MemoryKiB) exceeds 2 GiB-passes (2,097,152 KiB-passes).
+//
+// Enforcing DefaultMaxArgon2Params on creation guarantees that any vault created by
+// passwordium can always be opened by Open under its default resource limits.
+// When passed to Vault.Export, WithExportPassword must also be provided; otherwise
+// Vault.Export returns ErrEmptyPassword. Prefer Argon2ParamsMiB to construct params.
 func WithArgon2Params(params Argon2Params) CreateExportOption {
 	return argon2ParamsOption{params: params, allowWeak: false}
 }
@@ -150,18 +170,33 @@ func withUnsafeArgon2Params(params Argon2Params) CreateExportOption {
 	return argon2ParamsOption{params: params, allowWeak: true}
 }
 
-// WithOverwrite controls whether Create or Vault.Export may replace an existing vault
-// in the destination Storage. By default both refuse and return ErrAlreadyExists.
+// WithOverwrite controls whether Create or Vault.Export may overwrite an existing vault
+// in the target Storage backend.
+//
+// By default (enabled == false), both Create and Vault.Export check for an existing
+// vault before deriving keys and use atomic exclusive creation (SaveNew) where supported,
+// returning ErrAlreadyExists without modifying the existing vault. When enabled is true,
+// the newly encrypted vault atomically replaces any existing vault in Storage.
 func WithOverwrite(enabled bool) CreateExportOption {
 	return overwriteOption(enabled)
 }
 
-// WithExportPassword re-encrypts the exported vault under a new masterPassword and a
-// freshly generated 32-byte random salt. Without this option, Vault.Export writes an
-// encrypted snapshot using the active vault's current key hierarchy and header parameters.
+// WithExportPassword instructs Vault.Export to re-key the exported vault snapshot under
+// masterPassword using a freshly generated 32-byte random salt.
 //
-// WithExportPassword does not mutate masterPassword; callers should zero masterPassword
-// (for example, via clear(masterPassword)) once Export returns.
+// When WithExportPassword is supplied, Vault.Export derives a new masterKey, indexKey,
+// and secretKey (using the active vault's Argon2id parameters unless overridden via
+// WithArgon2Params) and re-encrypts each entry's padded SecretPayload in place as a
+// temporary byte slice without allocating immutable Go strings. If masterPassword is
+// empty (len(masterPassword) == 0), Vault.Export returns ErrEmptyPassword.
+//
+// Without this option, Vault.Export writes an encrypted snapshot using the active
+// vault's existing salt, Argon2id parameters, and key hierarchy without decrypting
+// individual entry secrets.
+//
+// WithExportPassword retains the slice header of masterPassword in the option value
+// and does not mutate its contents; callers should zero masterPassword (for example,
+// via clear(masterPassword)) once Vault.Export returns.
 func WithExportPassword(masterPassword []byte) ExportOption {
 	return exportOptionFunc(func(cfg *exportConfig) {
 		cfg.hasPassword = true
@@ -169,34 +204,60 @@ func WithExportPassword(masterPassword []byte) ExportOption {
 	})
 }
 
-// WithConflictPolicy sets the conflict resolution strategy used by Vault.Import when
-// an imported entry ID already exists in the destination vault. Defaults to ConflictKeepNewer.
+// WithConflictPolicy sets the ConflictPolicy used by Vault.Import when an entry ID in
+// the source vault already exists in the destination Vault.
+//
+// If WithConflictPolicy is not provided, Vault.Import defaults to ConflictKeepNewer.
+// Passing an unrecognized ConflictPolicy value causes Vault.Import to fail immediately
+// with ErrInvalidConflictPolicy before opening the source vault.
 func WithConflictPolicy(policy ConflictPolicy) ImportOption {
 	return importOptionFunc(func(cfg *importConfig) {
 		cfg.conflictPolicy = policy
 	})
 }
 
-// WithMaxArgon2Params sets the upper bounds on Argon2id parameters that Open or
-// Vault.Import will execute from an untrusted header. When max.Time and max.MemoryKiB
-// do not exceed DefaultMaxArgon2Params, the default 2 GiB-passes work limit continues
-// to apply (unless overridden via WithMaxArgon2Work); when either bound is raised above
-// default, the combined work limit becomes max.Time * max.MemoryKiB.
-// Headers exceeding the limits are rejected with ErrInvalidArgon2Params before any
-// key derivation runs. Without this option, DefaultMaxArgon2Params limits apply.
+// WithMaxArgon2Params overrides the default upper bounds (DefaultMaxArgon2Params) on
+// Argon2id parameters that Open or Vault.Import will accept from an untrusted vault
+// header before executing key derivation.
+//
+// The max parameters must themselves satisfy hard protocol bounds (Time in [1, 100],
+// MemoryKiB in [8, 4194304], Threads in [1, 255]); otherwise Open and Vault.Import
+// return ErrInvalidArgon2Params immediately.
+//
+// When max.Time and max.MemoryKiB do not exceed DefaultMaxArgon2Params (Time <= 16 and
+// MemoryKiB <= 512 MiB), the default combined work cap of 2 GiB-passes continues to
+// apply unless explicitly overridden with WithMaxArgon2Work. When either max.Time or
+// max.MemoryKiB is raised above DefaultMaxArgon2Params, the combined work cap defaults
+// to uint64(max.Time) * uint64(max.MemoryKiB). Any vault header exceeding these bounds
+// is rejected with ErrInvalidArgon2Params prior to running Argon2id.
 func WithMaxArgon2Params(max Argon2Params) OpenImportOption {
 	return maxArgon2ParamsOption{max: max}
 }
 
-// WithMaxArgon2Work sets an explicit upper bound on uint64(Time) * uint64(MemoryKiB)
-// accepted by Open or Vault.Import before running Argon2id. Passing 0 disables the
-// product check while keeping per-parameter bounds enforced.
+// WithMaxArgon2Work sets an explicit upper bound on the combined Argon2id work product
+// uint64(Time) * uint64(MemoryKiB) (expressed in KiB-passes) accepted by Open or
+// Vault.Import before running key derivation.
+//
+// Headers whose Time * MemoryKiB exceeds maxWorkKiBPasses are rejected during header
+// parsing with ErrInvalidArgon2Params. Passing 0 disables the combined work-product
+// check while still enforcing per-parameter bounds (from DefaultMaxArgon2Params or
+// WithMaxArgon2Params).
 func WithMaxArgon2Work(maxWorkKiBPasses uint64) OpenImportOption {
 	return maxArgon2WorkOption(maxWorkKiBPasses)
 }
 
-// WithAutoSave enables or disables automatic persistence to Storage after Put, Delete,
-// DeleteContext, and Import.
+// WithAutoSave enables or disables automatic persistence to the backing Storage after
+// every mutating operation on a Vault (Vault.Put, Vault.Delete, Vault.DeleteContext,
+// and Vault.Import).
+//
+// When enabled is true, each mutation immediately serializes, encrypts, and saves the
+// updated vault container while holding the Vault's write lock. If the underlying
+// Storage save fails (for example, due to I/O error, context cancellation, ErrVaultTooLarge,
+// or ErrConcurrentModification), the in-memory mutation and dirty flag are atomically
+// rolled back and the error is returned to the caller.
+//
+// By default (enabled == false), mutations only mark the Vault as dirty in memory until
+// Vault.Save or Vault.CloseWithSave is called explicitly.
 func WithAutoSave(enabled bool) CreateOpenOption {
 	return autoSaveOption(enabled)
 }
