@@ -153,7 +153,26 @@ func TestFileStorageLoadHardening(t *testing.T) {
 			t.Fatalf("Load at exact limit: len=%d err=%v", len(data), err)
 		}
 		if _, err := NewFileStorage(path, WithMaxFileSize(0)).Load(ctx); err == nil {
-			t.Fatal("non-positive max size must be rejected")
+			t.Fatal("non-positive max size must be rejected on Load")
+		}
+		if err := NewFileStorage(path, WithMaxFileSize(0)).Save(ctx, []byte("x")); err == nil {
+			t.Fatal("non-positive max size must be rejected on Save")
+		}
+
+		savePath := filepath.Join(dir, "bounded-save.psdm")
+		bounded := NewFileStorage(savePath, WithMaxFileSize(16))
+		if err := bounded.SaveNew(ctx, bytes.Repeat([]byte{0x01}, 17)); !errors.Is(err, ErrVaultTooLarge) {
+			t.Fatalf("oversized SaveNew err = %v, want ErrVaultTooLarge", err)
+		}
+		if err := bounded.Save(ctx, []byte("small")); err != nil {
+			t.Fatalf("Save within limit: %v", err)
+		}
+		if err := bounded.Save(ctx, bytes.Repeat([]byte{0x02}, 17)); !errors.Is(err, ErrVaultTooLarge) {
+			t.Fatalf("oversized Save err = %v, want ErrVaultTooLarge", err)
+		}
+		got, err := bounded.Load(ctx)
+		if err != nil || string(got) != "small" {
+			t.Fatalf("existing file after rejected oversized Save = %q, err=%v", got, err)
 		}
 	})
 
@@ -179,7 +198,10 @@ func TestFileStorageLoadHardening(t *testing.T) {
 		if err := fs.SaveNew(ctx, []byte("new")); !errors.Is(err, ErrInvalidStorageFile) {
 			t.Fatalf("symlink SaveNew err = %v, want ErrInvalidStorageFile", err)
 		}
-		// Ensure the symlink itself was not replaced by Save/SaveNew.
+		if err := fs.SaveIfMatch(ctx, []byte("ifmatch"), [32]byte{}); !errors.Is(err, ErrInvalidStorageFile) {
+			t.Fatalf("symlink SaveIfMatch err = %v, want ErrInvalidStorageFile", err)
+		}
+		// Ensure the symlink itself was not replaced by Save/SaveNew/SaveIfMatch.
 		linfo, err := os.Lstat(link)
 		if err != nil || linfo.Mode()&os.ModeSymlink == 0 {
 			t.Fatalf("symlink was clobbered: linfo=%+v err=%v", linfo, err)
@@ -207,8 +229,99 @@ func TestFileStorageLoadHardening(t *testing.T) {
 		if _, err := NewFileStorage("").Load(ctx); err == nil {
 			t.Fatal("empty path Load must fail")
 		}
+		if _, err := NewFileStorage("").Exists(ctx); err == nil {
+			t.Fatal("empty path Exists must fail")
+		}
 		if err := NewFileStorage("").Save(ctx, []byte("x")); err == nil {
 			t.Fatal("empty path Save must fail")
 		}
 	})
+}
+
+// uncomparableStorage is a value-type Storage implementation containing a slice field,
+// making its concrete type non-comparable in Go.
+type uncomparableStorage struct {
+	inner Storage
+	tag   []byte
+}
+
+func (u uncomparableStorage) Load(ctx context.Context) ([]byte, error) {
+	return u.inner.Load(ctx)
+}
+
+func (u uncomparableStorage) Save(ctx context.Context, data []byte) error {
+	return u.inner.Save(ctx, data)
+}
+
+func TestSameStorageUncomparableTypesNoPanic(t *testing.T) {
+	t.Parallel()
+
+	s1 := uncomparableStorage{inner: NewMemoryStorage(), tag: []byte("a")}
+	s2 := uncomparableStorage{inner: NewMemoryStorage(), tag: []byte("b")}
+
+	if sameStorage(s1, s2) {
+		t.Fatal("sameStorage(uncomparable) = true, want false")
+	}
+	if sameStorage(nil, s1) {
+		t.Fatal("sameStorage(nil, s1) = true, want false")
+	}
+
+	// Hard-linked FileStorage paths with distinct names must be detected as sameStorage via os.SameFile.
+	dir := t.TempDir()
+	p1 := filepath.Join(dir, "vault1.psdm")
+	p2 := filepath.Join(dir, "vault2.psdm")
+	if err := os.WriteFile(p1, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Link(p1, p2); err == nil {
+		if !sameStorage(NewFileStorage(p1), NewFileStorage(p2)) {
+			t.Fatal("sameStorage(hard-linked paths) = false, want true")
+		}
+	}
+}
+
+func TestMemoryAndFileStorageConditionalAndExclusiveEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	mem := NewMemoryStorage()
+	if _, err := mem.Exists(cancelCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled mem.Exists err = %v, want Canceled", err)
+	}
+	if err := mem.SaveNew(cancelCtx, []byte("a")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled mem.SaveNew err = %v, want Canceled", err)
+	}
+	if err := mem.SaveIfMatch(cancelCtx, []byte("a"), [32]byte{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled mem.SaveIfMatch err = %v, want Canceled", err)
+	}
+	if err := mem.SaveIfMatch(ctx, []byte("a"), [32]byte{}); !errors.Is(err, ErrConcurrentModification) {
+		t.Fatalf("empty mem.SaveIfMatch err = %v, want ErrConcurrentModification", err)
+	}
+	if err := mem.SaveNew(ctx, []byte("a")); err != nil {
+		t.Fatalf("mem.SaveNew: %v", err)
+	}
+	if err := mem.SaveNew(ctx, []byte("b")); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("duplicate mem.SaveNew err = %v, want ErrAlreadyExists", err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cond.psdm")
+	fs := NewFileStorage(path, WithMaxFileSize(32))
+	if _, err := fs.Exists(cancelCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled fs.Exists err = %v, want Canceled", err)
+	}
+	// SaveIfMatch when file does not exist returns ErrConcurrentModification.
+	if err := fs.SaveIfMatch(ctx, []byte("a"), [32]byte{}); !errors.Is(err, ErrConcurrentModification) {
+		t.Fatalf("missing file fs.SaveIfMatch err = %v, want ErrConcurrentModification", err)
+	}
+	// SaveIfMatch when file on disk was externally grown beyond maxSize returns ErrConcurrentModification.
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0x55}, 64), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := fs.SaveIfMatch(ctx, []byte("a"), [32]byte{}); !errors.Is(err, ErrConcurrentModification) {
+		t.Fatalf("oversized disk file fs.SaveIfMatch err = %v, want ErrConcurrentModification", err)
+	}
 }

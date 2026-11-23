@@ -77,14 +77,6 @@ func defaultImportConfig() importConfig {
 	return importConfig{conflictPolicy: ConflictKeepNewer}
 }
 
-type createOptionFunc func(*createConfig)
-
-func (f createOptionFunc) applyCreate(cfg *createConfig) { f(cfg) }
-
-type openOptionFunc func(*openConfig)
-
-func (f openOptionFunc) applyOpen(cfg *openConfig) { f(cfg) }
-
 type exportOptionFunc func(*exportConfig)
 
 func (f exportOptionFunc) applyExport(cfg *exportConfig) { f(cfg) }

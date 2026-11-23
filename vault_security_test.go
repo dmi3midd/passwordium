@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -357,10 +358,10 @@ func TestConcurrentCreateDoesNotOverwriteAndAvoidsFullRead(t *testing.T) {
 	// 1. Existing oversized file is detected via Lstat (Exists) without reading it into RAM.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "existing.psdm")
-	bigStore := NewFileStorage(path, WithMaxFileSize(128))
-	if err := bigStore.Save(ctx, bytes.Repeat([]byte{0x42}, 1024)); err != nil {
-		t.Fatalf("Save oversized fixture: %v", err)
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0x42}, 1024), 0o600); err != nil {
+		t.Fatalf("WriteFile oversized fixture: %v", err)
 	}
+	bigStore := NewFileStorage(path, WithMaxFileSize(128))
 	if _, err := Create(ctx, bigStore, []byte("pw"), fastTestArgon2()); !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("Create on existing oversized file err = %v, want ErrAlreadyExists", err)
 	}
@@ -857,11 +858,13 @@ func FuzzUnpackEnvelope(f *testing.F) {
 }
 
 // FuzzPadUnpadSecret verifies that padSecret/unpadSecret round-trip arbitrary payloads
-// and unpadSecret never panics on arbitrary corrupted slices.
+// and unpadSecret/validateSecretPayloadWire never panic on arbitrary corrupted slices.
 func FuzzPadUnpadSecret(f *testing.F) {
 	f.Add([]byte{})
 	f.Add([]byte{0x80})
 	f.Add([]byte{0x00})
+	f.Add([]byte{0x0a, 0x02, 0xff, 0xfe})
+	f.Add([]byte{0x80, 0x80, 0xa2, 0xeb, 0x30, 0x30})
 	f.Add(bytes.Repeat([]byte{0xAB}, 255))
 	f.Add(bytes.Repeat([]byte{0xCD}, 256))
 
@@ -875,7 +878,12 @@ func FuzzPadUnpadSecret(f *testing.F) {
 			t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(data))
 		}
 		_, _ = unpadSecret(data)
-		_ = validateSecretPayloadWire(data)
+		if err := validateSecretPayloadWire(data); err == nil {
+			var pb vaultpb.SecretPayload
+			if uerr := proto.Unmarshal(data, &pb); uerr != nil {
+				t.Fatalf("validateSecretPayloadWire accepted %x, but proto.Unmarshal failed: %v", data, uerr)
+			}
+		}
 	})
 }
 
@@ -1188,7 +1196,7 @@ func TestVaultImportConflictPoliciesAndAtomicity(t *testing.T) {
 			t.Fatalf("vA mutated on failed Import: Dirty=%v Len=%d", vA.Dirty(), vA.Len())
 		}
 
-		// Failed autosave during Import must roll back vA's entries and dirty flag.
+		//Failed autosave during Import must roll back vA's entries and dirty flag.
 		fs := &failingStorage{inner: sA, err: errors.New("disk full")}
 		vA.mu.Lock()
 		vA.store = fs
@@ -1203,4 +1211,434 @@ func TestVaultImportConflictPoliciesAndAtomicity(t *testing.T) {
 			t.Fatalf("vA not rolled back after failed autosave Import: Dirty=%v Len=%d", vA.Dirty(), vA.Len())
 		}
 	})
+}
+
+// Audit Phase 2 FINDING-01 & RISK-03: prevent uint64 version overflow (MaxUint64 -> 0) in Open,
+// Put, Import, and Save, and expose Version() / UpdatedAt() for whole-vault rollback tracking.
+func TestVersionOverflowBoundsAndMetadataAccessors(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := NewMemoryStorage()
+	pass := []byte("version-overflow-pass")
+
+	v, err := Create(ctx, store, pass, fastTestArgon2())
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if v.Version() != 1 {
+		t.Fatalf("initial Version() = %d, want 1", v.Version())
+	}
+	if v.UpdatedAt().IsZero() {
+		t.Fatal("initial UpdatedAt() must not be zero")
+	}
+
+	id, err := v.Put(ctx, EntryMeta{ID: "e1", Title: "Entry"}, Secret{Password: "pw1"})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := v.Save(ctx); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if v.Version() != 2 {
+		t.Fatalf("Version() after Save = %d, want 2", v.Version())
+	}
+
+	// 1. Put must refuse to overflow an entry's version to MaxUint64 / 0.
+	v.entries[id].version = math.MaxUint64 - 1
+	if _, err := v.Put(ctx, EntryMeta{ID: id, Title: "Overflow"}, Secret{Password: "pw2"}); !errors.Is(err, ErrCorruptedVault) {
+		t.Fatalf("Put at MaxUint64-1 err = %v, want ErrCorruptedVault", err)
+	}
+	if v.entries[id].version != math.MaxUint64-1 {
+		t.Fatalf("entry version mutated on failed Put: %d", v.entries[id].version)
+	}
+	v.entries[id].version = 1
+
+	// 2. Save must refuse to overflow the container version to MaxUint64 / 0.
+	v.version = math.MaxUint64 - 1
+	if err := v.Save(ctx); !errors.Is(err, ErrCorruptedVault) {
+		t.Fatalf("Save at MaxUint64-1 err = %v, want ErrCorruptedVault", err)
+	}
+	v.version = 2
+
+	// 3. Import must refuse to overflow targetVersion when merging with an entry at MaxUint64-1.
+	srcStore := NewMemoryStorage()
+	vSrc, err := Create(ctx, srcStore, pass, fastTestArgon2())
+	if err != nil {
+		t.Fatalf("Create src: %v", err)
+	}
+	if _, err := vSrc.Put(ctx, EntryMeta{ID: id, Title: "FromSrc"}, Secret{Password: "src-pw"}); err != nil {
+		t.Fatalf("vSrc.Put: %v", err)
+	}
+	// Advance version to MaxUint64-2 and call Put so secret is authenticated with AAD "<id>:<MaxUint64-1>".
+	vSrc.entries[id].version = math.MaxUint64 - 2
+	if _, err := vSrc.Put(ctx, EntryMeta{ID: id, Title: "FromSrc"}, Secret{Password: "src-pw"}); err != nil {
+		t.Fatalf("vSrc.Put at MaxUint64-1: %v", err)
+	}
+	vSrc.entries[id].updatedAt = time.Now().UTC().Unix() + 100
+	if err := vSrc.Save(ctx); err != nil {
+		t.Fatalf("vSrc.Save: %v", err)
+	}
+	_ = vSrc.Close()
+
+	if _, err := v.Import(ctx, srcStore, pass, WithConflictPolicy(ConflictKeepNewer)); !errors.Is(err, ErrCorruptedVault) {
+		t.Fatalf("Import(KeepNewer overflow) err = %v, want ErrCorruptedVault", err)
+	}
+	if _, err := v.Import(ctx, srcStore, pass, WithConflictPolicy(ConflictOverwrite)); !errors.Is(err, ErrCorruptedVault) {
+		t.Fatalf("Import(Overwrite overflow) err = %v, want ErrCorruptedVault", err)
+	}
+
+	// 4. Open must reject outer VaultData with Version == 0 or MaxUint64, and entries with Version == MaxUint64.
+	indexKey := testIndexKey(t, store, pass)
+	raw, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	hdrBytes := raw[:headerSize]
+
+	validNonce := make([]byte, crypto.NonceSize)
+	validSecret := make([]byte, crypto.Overhead+secretPadBlockSize)
+
+	for name, pb := range map[string]*vaultpb.VaultData{
+		"vault_version_zero": {
+			Version: 0,
+		},
+		"vault_version_max_uint64": {
+			Version: math.MaxUint64,
+		},
+		"entry_version_max_uint64": {
+			Version: 1,
+			Entries: []*vaultpb.Entry{
+				{Id: "e1", Version: math.MaxUint64, SecretNonce: validNonce, EncryptedSecret: validSecret},
+			},
+		},
+		"unaligned_encrypted_secret_size": {
+			Version: 1,
+			Entries: []*vaultpb.Entry{
+				{Id: "e1", Version: 1, SecretNonce: validNonce, EncryptedSecret: make([]byte, crypto.Overhead+100)},
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			plain, err := proto.Marshal(pb)
+			if err != nil {
+				t.Fatalf("proto.Marshal: %v", err)
+			}
+			nonce, ct, err := crypto.Encrypt(indexKey, plain, hdrBytes)
+			if err != nil {
+				t.Fatalf("Encrypt: %v", err)
+			}
+			s := NewMemoryStorageWithData(packEnvelope(hdrBytes, nonce, ct))
+			if _, err := Open(ctx, s, pass); !errors.Is(err, ErrCorruptedVault) {
+				t.Fatalf("Open(%s) err = %v, want ErrCorruptedVault", name, err)
+			}
+		})
+	}
+
+	_ = v.Close()
+	if v.Version() != 0 || !v.UpdatedAt().IsZero() {
+		t.Fatalf("after Close: Version=%d UpdatedAt=%v, want 0 and zero time", v.Version(), v.UpdatedAt())
+	}
+}
+
+// Audit Phase 2 FINDING-02: UTF-8 validation in validateSecretPayloadWire, Put, Import, and Export.
+func TestUTF8ValidationInPutImportAndExport(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	pass := []byte("utf8-validation-pass")
+	v, err := Create(ctx, NewMemoryStorage(), pass, fastTestArgon2())
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer func() { _ = v.Close() }()
+
+	badUTF8 := "invalid-\xff-utf8"
+
+	// 1. Put rejects invalid UTF-8 in all EntryMeta fields before mutating the vault.
+	for name, meta := range map[string]EntryMeta{
+		"bad_id":       {ID: badUTF8, Title: "ok"},
+		"bad_title":    {Title: badUTF8},
+		"bad_username": {Title: "ok", Username: badUTF8},
+		"bad_url":      {Title: "ok", URL: badUTF8},
+		"bad_tag":      {Title: "ok", Tags: []string{"valid", badUTF8}},
+	} {
+		if _, err := v.Put(ctx, meta, Secret{Password: "ok"}); err == nil {
+			t.Fatalf("Put(%s) unexpectedly succeeded with invalid UTF-8", name)
+		}
+	}
+	if v.Dirty() || v.Len() != 0 {
+		t.Fatalf("failed UTF-8 Put mutated vault: Dirty=%v Len=%d", v.Dirty(), v.Len())
+	}
+
+	id, err := v.Put(ctx, EntryMeta{ID: "target", Title: "Valid"}, Secret{Password: "original-secret"})
+	if err != nil {
+		t.Fatalf("Put valid: %v", err)
+	}
+	if err := v.Save(ctx); err != nil {
+		t.Fatalf("Save valid: %v", err)
+	}
+
+	// 2. Wire-level non-UTF-8 payloads inside SecretPayload are rejected by validateSecretPayloadWire,
+	// Import, and re-keyed Export.
+	badWirePayloads := map[string][]byte{
+		"bad_password":          {0x0a, 0x02, 0xff, 0xfe},                              // field 1 (password): "\xff\xfe"
+		"bad_notes":             {0x12, 0x02, 0xff, 0xfe},                              // field 2 (notes): "\xff\xfe"
+		"bad_custom_field_key":  {0x1a, 0x04, 0x0a, 0x02, 0xff, 0xfe},                  // field 3 -> key: "\xff\xfe"
+		"bad_custom_field_val":  {0x1a, 0x07, 0x0a, 0x01, 'k', 0x12, 0x02, 0xff, 0xfe}, // field 3 -> val: "\xff\xfe"
+		"overflow_32bit_tag":    {0x80, 0x80, 0xa2, 0xeb, 0x30, 0x30},                  // >32-bit tag varint
+		"unknown_field_num":     {0x20, 0x01},                                          // field 4 varint
+		"wrong_wire_type_field": {0x08, 0x01},                                          // field 1 as varint instead of bytes
+		"wrong_wire_type_map":   {0x18, 0x01},                                          // field 3 as varint instead of bytes
+		"truncated_map_entry":   {0x1a, 0x05, 0x0a, 0x01, 'k'},                         // field 3 length 5, only 3 bytes
+		"map_unknown_field":     {0x1a, 0x02, 0x18, 0x01},                              // field 3 -> field 3 varint
+		"map_wrong_wire_type":   {0x1a, 0x02, 0x08, 0x01},                              // field 3 -> field 1 as varint
+		"map_bad_tag":           {0x1a, 0x01, 0x00},                                    // field 3 -> tag 0
+	}
+
+	for name, rawWire := range badWirePayloads {
+		if err := validateSecretPayloadWire(rawWire); !errors.Is(err, ErrSecretCorrupted) {
+			t.Fatalf("validateSecretPayloadWire(%s) err = %v, want ErrSecretCorrupted", name, err)
+		}
+
+		// Build a source vault containing this non-UTF-8 SecretPayload encrypted under its secretKey.
+		srcStore := NewMemoryStorage()
+		vSrc, err := Create(ctx, srcStore, pass, fastTestArgon2())
+		if err != nil {
+			t.Fatalf("Create src: %v", err)
+		}
+		if _, err := vSrc.Put(ctx, EntryMeta{ID: id, Title: "CorruptUTF8"}, Secret{Password: "placeholder"}); err != nil {
+			t.Fatalf("vSrc.Put: %v", err)
+		}
+		vSrc.entries[id].updatedAt = time.Now().UTC().Unix() + 100
+		padded := padSecret(rawWire)
+		nonce, ct, err := vSrc.secretCipher.Encrypt(padded, entryAAD(id, vSrc.entries[id].version))
+		if err != nil {
+			t.Fatalf("Encrypt bad wire: %v", err)
+		}
+		vSrc.entries[id].secretNonce = nonce
+		vSrc.entries[id].encryptedSecret = ct
+		if err := vSrc.Save(ctx); err != nil {
+			t.Fatalf("vSrc.Save: %v", err)
+		}
+
+		// Re-keyed Export on vSrc must reject the corrupted non-UTF-8 secret.
+		if err := vSrc.Export(ctx, NewMemoryStorage(), WithExportPassword([]byte("new-pw")), fastTestArgon2()); !errors.Is(err, ErrSecretCorrupted) {
+			t.Fatalf("Export(%s) err = %v, want ErrSecretCorrupted", name, err)
+		}
+		_ = vSrc.Close()
+
+		// Import into v must reject with ErrSecretCorrupted and preserve v's existing entry intact.
+		if _, err := v.Import(ctx, srcStore, pass, WithConflictPolicy(ConflictOverwrite)); !errors.Is(err, ErrSecretCorrupted) {
+			t.Fatalf("Import(%s) err = %v, want ErrSecretCorrupted", name, err)
+		}
+		sec, err := v.GetSecret(id)
+		if err != nil || sec.Password != "original-secret" {
+			t.Fatalf("existing secret corrupted after rejected Import(%s): %+v, err=%v", name, sec, err)
+		}
+	}
+}
+
+// Audit Phase 2 FINDING-03: FileStorage.Save rejects envelopes exceeding WithMaxFileSize
+// with ErrVaultTooLarge before writing to disk, preserving consistency for subsequent saves and opens.
+func TestVaultFileStorageMaxFileSizeEnforcedOnSave(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "limited.psdm")
+	store := NewFileStorage(path, WithMaxFileSize(1024))
+	pass := []byte("bounded-vault-pass")
+
+	v, err := Create(ctx, store, pass, fastTestArgon2(), WithAutoSave(true))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer func() { _ = v.Close() }()
+
+	id1, err := v.Put(ctx, EntryMeta{Title: "Small"}, Secret{Password: "pw1"})
+	if err != nil {
+		t.Fatalf("Put small: %v", err)
+	}
+
+	// Attempt to add an entry that pushes the serialized vault over 1024 bytes.
+	_, err = v.Put(ctx, EntryMeta{Title: "Huge"}, Secret{
+		Password: strings.Repeat("A", 1200),
+	})
+	if !errors.Is(err, ErrVaultTooLarge) {
+		t.Fatalf("oversized Put with autosave err = %v, want ErrVaultTooLarge", err)
+	}
+	if v.Len() != 1 || v.Dirty() {
+		t.Fatalf("vault state after rejected oversized Put: Len=%d Dirty=%v", v.Len(), v.Dirty())
+	}
+
+	// Subsequent valid update and reopen must still succeed without ErrConcurrentModification.
+	if _, err := v.Put(ctx, EntryMeta{ID: id1, Title: "Small-v2"}, Secret{Password: "pw2"}); err != nil {
+		t.Fatalf("subsequent valid Put failed: %v", err)
+	}
+
+	reopened, err := Open(ctx, store, pass)
+	if err != nil {
+		t.Fatalf("Open after rejected oversized Save: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	sec, err := reopened.GetSecret(id1)
+	if err != nil || sec.Password != "pw2" {
+		t.Fatalf("GetSecret = %+v, err=%v", sec, err)
+	}
+}
+
+// Audit Phase 2 FINDING-04: ConflictOverwrite and Put maintain monotonic UpdatedAt >= CreatedAt.
+func TestTimestampMonotonicityOnOverwriteAndClockSkew(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	pass := []byte("timestamp-pass")
+
+	vA, err := Create(ctx, NewMemoryStorage(), pass, fastTestArgon2())
+	if err != nil {
+		t.Fatalf("Create A: %v", err)
+	}
+	defer func() { _ = vA.Close() }()
+
+	// Simulate an entry whose CreatedAt/UpdatedAt is ahead of the current wall clock (clock skew).
+	id, err := vA.Put(ctx, EntryMeta{ID: "skewed", Title: "V1"}, Secret{Password: "pw1"})
+	if err != nil {
+		t.Fatalf("Put v1: %v", err)
+	}
+	futureTime := time.Now().UTC().Unix() + 3600
+	vA.entries[id].createdAt = futureTime
+	vA.entries[id].updatedAt = futureTime
+
+	if _, err := vA.Put(ctx, EntryMeta{ID: id, Title: "V2"}, Secret{Password: "pw2"}); err != nil {
+		t.Fatalf("Put v2: %v", err)
+	}
+	meta, err := vA.GetMeta(id)
+	if err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	}
+	if meta.UpdatedAt.Before(meta.CreatedAt) || meta.UpdatedAt.Unix() < futureTime {
+		t.Fatalf("Put allowed UpdatedAt (%v) to regress below CreatedAt/previous UpdatedAt (%v)", meta.UpdatedAt, meta.CreatedAt)
+	}
+
+	// Import with ConflictOverwrite where source entry has an older UpdatedAt than destination entry.
+	srcStore := NewMemoryStorage()
+	vB, err := Create(ctx, srcStore, pass, fastTestArgon2())
+	if err != nil {
+		t.Fatalf("Create B: %v", err)
+	}
+	if _, err := vB.Put(ctx, EntryMeta{ID: id, Title: "FromB"}, Secret{Password: "pw-from-B"}); err != nil {
+		t.Fatalf("vB.Put: %v", err)
+	}
+	vB.entries[id].updatedAt = 1000 // older than futureTime
+	if err := vB.Save(ctx); err != nil {
+		t.Fatalf("vB.Save: %v", err)
+	}
+	_ = vB.Close()
+
+	if _, err := vA.Import(ctx, srcStore, pass, WithConflictPolicy(ConflictOverwrite)); err != nil {
+		t.Fatalf("Import(ConflictOverwrite): %v", err)
+	}
+	metaAfter, err := vA.GetMeta(id)
+	if err != nil {
+		t.Fatalf("GetMeta after Import: %v", err)
+	}
+	if metaAfter.UpdatedAt.Before(metaAfter.CreatedAt) || metaAfter.UpdatedAt.Unix() < futureTime {
+		t.Fatalf("ConflictOverwrite regressed UpdatedAt to %v (CreatedAt=%v)", metaAfter.UpdatedAt, metaAfter.CreatedAt)
+	}
+}
+
+// minimalStorage implements only the base Storage interface (Load and Save), without
+// existenceChecker, exclusiveSaver, or conditionalSaver, to exercise fallback paths.
+type minimalStorage struct {
+	inner *MemoryStorage
+}
+
+func (m *minimalStorage) Load(ctx context.Context) ([]byte, error) {
+	return m.inner.Load(ctx)
+}
+
+func (m *minimalStorage) Save(ctx context.Context, data []byte) error {
+	return m.inner.Save(ctx, data)
+}
+
+func TestMinimalStorageFallbackAndClosedOrCanceledOperations(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	pass := []byte("minimal-storage-pass")
+	store := &minimalStorage{inner: NewMemoryStorage()}
+
+	v, err := Create(ctx, store, pass, fastTestArgon2())
+	if err != nil {
+		t.Fatalf("Create on minimalStorage: %v", err)
+	}
+	if _, err := Create(ctx, store, pass, fastTestArgon2()); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("second Create on minimalStorage err = %v, want ErrAlreadyExists", err)
+	}
+	vOverwrite, err := Create(ctx, store, pass, fastTestArgon2(), WithOverwrite(true))
+	if err != nil {
+		t.Fatalf("Create(WithOverwrite) on minimalStorage: %v", err)
+	}
+	_ = v.Close()
+	v = vOverwrite
+
+	// Add entries with case-colliding and identical titles to exercise Search sort tie-breakers.
+	if _, err := v.Put(ctx, EntryMeta{ID: "id-b", Title: "app"}, Secret{Password: "pw1"}); err != nil {
+		t.Fatalf("Put id-b: %v", err)
+	}
+	if _, err := v.Put(ctx, EntryMeta{ID: "id-c", Title: "App"}, Secret{Password: "pw2"}); err != nil {
+		t.Fatalf("Put id-c: %v", err)
+	}
+	if _, err := v.Put(ctx, EntryMeta{ID: "id-a", Title: "App"}, Secret{Password: "pw3"}); err != nil {
+		t.Fatalf("Put id-a: %v", err)
+	}
+	results := v.Search(SearchQuery{Query: "app"})
+	if len(results) != 3 || results[0].ID != "id-a" || results[1].ID != "id-c" || results[2].ID != "id-b" {
+		t.Fatalf("Search tie-breaker order = %+v, want [id-a, id-c, id-b]", results)
+	}
+	if err := v.Save(ctx); err != nil {
+		t.Fatalf("Save on minimalStorage: %v", err)
+	}
+
+	dst := &minimalStorage{inner: NewMemoryStorage()}
+	if err := v.Export(ctx, dst); err != nil {
+		t.Fatalf("Export to minimalStorage: %v", err)
+	}
+	if err := v.Export(ctx, dst); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("second Export to minimalStorage err = %v, want ErrAlreadyExists", err)
+	}
+
+	// Import with WithMaxArgon2Work option.
+	if _, err := v.Import(ctx, dst, pass, WithMaxArgon2Work(1)); !errors.Is(err, ErrInvalidArgon2Params) {
+		t.Fatalf("Import(tight WithMaxArgon2Work) err = %v, want ErrInvalidArgon2Params", err)
+	}
+	if _, err := v.Import(ctx, dst, pass, WithMaxArgon2Work(1024)); err != nil {
+		t.Fatalf("Import(valid WithMaxArgon2Work): %v", err)
+	}
+
+	// CloseWithSave on clean vault and canceled context checks.
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := v.Save(cancelCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Save err = %v, want Canceled", err)
+	}
+	if err := v.Export(cancelCtx, NewMemoryStorage()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Export err = %v, want Canceled", err)
+	}
+	if _, err := v.Import(cancelCtx, dst, pass); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Import err = %v, want Canceled", err)
+	}
+	if err := v.CloseWithSave(cancelCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled CloseWithSave err = %v, want Canceled", err)
+	}
+
+	if err := v.CloseWithSave(ctx); err != nil {
+		t.Fatalf("CloseWithSave on clean vault: %v", err)
+	}
+	if err := v.Export(ctx, NewMemoryStorage()); !errors.Is(err, ErrVaultClosed) {
+		t.Fatalf("Export on closed vault err = %v, want ErrVaultClosed", err)
+	}
+	if _, err := v.Import(ctx, dst, pass); !errors.Is(err, ErrVaultClosed) {
+		t.Fatalf("Import on closed vault err = %v, want ErrVaultClosed", err)
+	}
 }

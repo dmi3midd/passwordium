@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 )
 
@@ -250,6 +251,12 @@ func (s *FileStorage) save(ctx context.Context, data []byte, mode fileSaveMode, 
 	if s.path == "" {
 		return errors.New("passwordium: file storage path is empty")
 	}
+	if s.maxSize <= 0 {
+		return errors.New("passwordium: max file size must be positive")
+	}
+	if int64(len(data)) > s.maxSize {
+		return fmt.Errorf("%w: %d bytes exceeds limit %d", ErrVaultTooLarge, len(data), s.maxSize)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -414,29 +421,29 @@ func NewMemoryStorageWithData(data []byte) *MemoryStorage {
 }
 
 // sameStorage reports whether a and b refer to the same underlying storage target.
-func sameStorage(a, b Storage) (bool, error) {
+func sameStorage(a, b Storage) bool {
 	if a == nil || b == nil {
-		return false, nil
+		return false
 	}
-	if a == b {
-		return true, nil
+	if reflect.TypeOf(a).Comparable() && reflect.TypeOf(b).Comparable() && a == b {
+		return true
 	}
 	fa, okA := a.(*FileStorage)
 	fb, okB := b.(*FileStorage)
 	if !okA || !okB || fa.path == "" || fb.path == "" {
-		return false, nil
+		return false
 	}
 	absA, errA := filepath.Abs(fa.path)
 	absB, errB := filepath.Abs(fb.path)
 	if errA == nil && errB == nil && absA == absB {
-		return true, nil
+		return true
 	}
 	infoA, errA := os.Lstat(fa.path)
 	infoB, errB := os.Lstat(fb.path)
 	if errA == nil && errB == nil && os.SameFile(infoA, infoB) {
-		return true, nil
+		return true
 	}
-	return false, nil
+	return false
 }
 
 // Exists reports whether any vault data has been saved in memory.

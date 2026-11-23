@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dmi3midd/passwordium/internal/crypto"
 	"github.com/dmi3midd/passwordium/internal/vaultpb"
@@ -138,11 +140,23 @@ func unpadSecret(padded []byte) ([]byte, error) {
 	return nil, ErrSecretCorrupted
 }
 
+func consumeValidTag(b []byte) (protowire.Number, protowire.Type, int) {
+	v, n := protowire.ConsumeVarint(b)
+	if n < 0 || v > math.MaxUint32 {
+		return 0, 0, -1
+	}
+	num, typ := protowire.DecodeTag(v)
+	if num < protowire.MinValidNumber || num > protowire.MaxValidNumber {
+		return 0, 0, -1
+	}
+	return num, typ, n
+}
+
 // validateSecretPayloadWire verifies that b is a syntactically valid protobuf
 // encoding of vaultpb.SecretPayload without allocating Go strings or maps on the heap.
 func validateSecretPayloadWire(b []byte) error {
 	for len(b) > 0 {
-		num, typ, n := protowire.ConsumeTag(b)
+		num, typ, n := consumeValidTag(b)
 		if n < 0 {
 			return ErrSecretCorrupted
 		}
@@ -153,8 +167,8 @@ func validateSecretPayloadWire(b []byte) error {
 			if typ != protowire.BytesType {
 				return ErrSecretCorrupted
 			}
-			_, m := protowire.ConsumeBytes(b)
-			if m < 0 {
+			v, m := protowire.ConsumeBytes(b)
+			if m < 0 || !utf8.Valid(v) {
 				return ErrSecretCorrupted
 			}
 			b = b[m:]
@@ -171,11 +185,7 @@ func validateSecretPayloadWire(b []byte) error {
 			}
 			b = b[m:]
 		default:
-			m := protowire.ConsumeFieldValue(num, typ, b)
-			if m < 0 {
-				return ErrSecretCorrupted
-			}
-			b = b[m:]
+			return ErrSecretCorrupted
 		}
 	}
 	return nil
@@ -183,7 +193,7 @@ func validateSecretPayloadWire(b []byte) error {
 
 func validateMapEntryWire(b []byte) error {
 	for len(b) > 0 {
-		num, typ, n := protowire.ConsumeTag(b)
+		num, typ, n := consumeValidTag(b)
 		if n < 0 {
 			return ErrSecretCorrupted
 		}
@@ -194,17 +204,28 @@ func validateMapEntryWire(b []byte) error {
 			if typ != protowire.BytesType {
 				return ErrSecretCorrupted
 			}
-			_, m := protowire.ConsumeBytes(b)
-			if m < 0 {
+			v, m := protowire.ConsumeBytes(b)
+			if m < 0 || !utf8.Valid(v) {
 				return ErrSecretCorrupted
 			}
 			b = b[m:]
 		default:
-			m := protowire.ConsumeFieldValue(num, typ, b)
-			if m < 0 {
-				return ErrSecretCorrupted
-			}
-			b = b[m:]
+			return ErrSecretCorrupted
+		}
+	}
+	return nil
+}
+
+func validateEntryMetaUTF8(meta EntryMeta) error {
+	if !utf8.ValidString(meta.ID) ||
+		!utf8.ValidString(meta.Title) ||
+		!utf8.ValidString(meta.Username) ||
+		!utf8.ValidString(meta.URL) {
+		return errors.New("passwordium: entry metadata contains invalid UTF-8")
+	}
+	for _, tag := range meta.Tags {
+		if !utf8.ValidString(tag) {
+			return errors.New("passwordium: entry tag contains invalid UTF-8")
 		}
 	}
 	return nil
@@ -290,6 +311,11 @@ func Create(ctx context.Context, store Storage, masterPassword []byte, opts ...C
 
 	indexCipher, secretCipher, err := deriveVaultCiphers(masterPassword, hdr.Salt[:], hdr.Params)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		indexCipher.Close()
+		secretCipher.Close()
 		return nil, err
 	}
 
@@ -395,6 +421,11 @@ func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...Ope
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		indexCipher.Close()
+		secretCipher.Close()
+		return nil, err
+	}
 	closeCiphers := func() {
 		indexCipher.Close()
 		secretCipher.Close()
@@ -412,6 +443,10 @@ func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...Ope
 		closeCiphers()
 		return nil, fmt.Errorf("%w: %w", ErrCorruptedVault, err)
 	}
+	if pb.Version == 0 || pb.Version == math.MaxUint64 {
+		closeCiphers()
+		return nil, fmt.Errorf("%w: invalid vault version %d", ErrCorruptedVault, pb.Version)
+	}
 
 	entries := make(map[string]*entryRecord, len(pb.Entries))
 	for _, e := range pb.Entries {
@@ -419,17 +454,17 @@ func Open(ctx context.Context, store Storage, masterPassword []byte, opts ...Ope
 			closeCiphers()
 			return nil, fmt.Errorf("%w: entry missing id", ErrCorruptedVault)
 		}
-		if e.Version == 0 {
+		if e.Version == 0 || e.Version == math.MaxUint64 {
 			closeCiphers()
-			return nil, fmt.Errorf("%w: entry %q has invalid version 0", ErrCorruptedVault, e.Id)
+			return nil, fmt.Errorf("%w: entry %q has invalid version %d", ErrCorruptedVault, e.Id, e.Version)
 		}
 		if len(e.SecretNonce) != crypto.NonceSize {
 			closeCiphers()
 			return nil, fmt.Errorf("%w: entry %q has invalid secret nonce size %d", ErrCorruptedVault, e.Id, len(e.SecretNonce))
 		}
-		if len(e.EncryptedSecret) < crypto.Overhead {
+		if len(e.EncryptedSecret) < secretPadBlockSize+crypto.Overhead || (len(e.EncryptedSecret)-crypto.Overhead)%secretPadBlockSize != 0 {
 			closeCiphers()
-			return nil, fmt.Errorf("%w: entry %q has truncated encrypted secret", ErrCorruptedVault, e.Id)
+			return nil, fmt.Errorf("%w: entry %q has invalid encrypted secret size %d", ErrCorruptedVault, e.Id, len(e.EncryptedSecret))
 		}
 		if _, dup := entries[e.Id]; dup {
 			closeCiphers()
@@ -472,6 +507,9 @@ func (v *Vault) Put(ctx context.Context, meta EntryMeta, secret Secret) (string,
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	if err := validateEntryMetaUTF8(meta); err != nil {
+		return "", err
+	}
 
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -497,9 +535,19 @@ func (v *Vault) Put(ctx context.Context, meta EntryMeta, secret Secret) (string,
 
 	version := uint64(1)
 	createdAt := now
+	updatedAt := now
 	if exists {
+		if existing.version >= math.MaxUint64-1 {
+			return "", fmt.Errorf("%w: entry %q version overflow", ErrCorruptedVault, id)
+		}
 		version = existing.version + 1
 		createdAt = existing.createdAt
+		if existing.updatedAt > updatedAt {
+			updatedAt = existing.updatedAt
+		}
+		if createdAt > updatedAt {
+			updatedAt = createdAt
+		}
 	}
 
 	// proto.Marshal does not retain or mutate CustomFields, so no defensive copy is needed.
@@ -529,7 +577,7 @@ func (v *Vault) Put(ctx context.Context, meta EntryMeta, secret Secret) (string,
 		url:             meta.URL,
 		tags:            slices.Clone(meta.Tags),
 		createdAt:       createdAt,
-		updatedAt:       now,
+		updatedAt:       updatedAt,
 		secretNonce:     secretNonce,
 		encryptedSecret: encryptedSecret,
 	}
@@ -777,18 +825,19 @@ func (v *Vault) Export(ctx context.Context, dst Storage, opts ...ExportOption) e
 	}
 
 	v.mu.RLock()
-	defer v.mu.RUnlock()
+	closed := v.closed
+	ownStore := v.store
+	exportHdr := v.hdr
+	v.mu.RUnlock()
 
-	if v.closed {
+	if closed {
 		return ErrVaultClosed
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	if same, err := sameStorage(v.store, dst); err != nil {
-		return err
-	} else if same {
+	if sameStorage(ownStore, dst) {
 		return ErrSameStorage
 	}
 
@@ -798,8 +847,7 @@ func (v *Vault) Export(ctx context.Context, dst Storage, opts ...ExportOption) e
 		}
 	}
 
-	exportHdr := v.hdr
-	exportIndexCipher := v.indexCipher
+	var derivedIndexCipher *crypto.Cipher
 	var exportSecretCipher *crypto.Cipher
 
 	if cfg.hasPassword {
@@ -817,76 +865,102 @@ func (v *Vault) Export(ctx context.Context, dst Storage, opts ...ExportOption) e
 		}
 		defer ic.Close()
 		defer sc.Close()
-		exportIndexCipher = ic
-		exportSecretCipher = sc
-	}
-
-	ids := slices.Sorted(maps.Keys(v.entries))
-	pbEntries := make([]*vaultpb.Entry, 0, len(ids))
-	defer func() {
-		for _, pe := range pbEntries {
-			crypto.ZeroBytes(pe.SecretNonce)
-			crypto.ZeroBytes(pe.EncryptedSecret)
-		}
-	}()
-
-	for _, id := range ids {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		rec := v.entries[id]
-		pe := rec.toProto()
+		derivedIndexCipher = ic
+		exportSecretCipher = sc
+	}
 
-		if exportSecretCipher != nil {
-			aad := entryAAD(rec.id, rec.version)
-			paddedPlain, err := v.secretCipher.Decrypt(rec.secretNonce, rec.encryptedSecret, aad)
-			if err != nil {
-				return fmt.Errorf("%w: %w", ErrSecretCorrupted, err)
-			}
-			unpadded, err := unpadSecret(paddedPlain)
-			if err != nil {
-				crypto.ZeroBytes(paddedPlain)
-				return err
-			}
-			if err := validateSecretPayloadWire(unpadded); err != nil {
-				crypto.ZeroBytes(paddedPlain)
-				return err
-			}
-			newNonce, newCT, err := exportSecretCipher.Encrypt(paddedPlain, aad)
-			crypto.ZeroBytes(paddedPlain)
-			if err != nil {
-				return fmt.Errorf("passwordium: re-encrypt exported secret: %w", err)
-			}
-			crypto.ZeroBytes(pe.SecretNonce)
-			crypto.ZeroBytes(pe.EncryptedSecret)
-			pe.SecretNonce = newNonce
-			pe.EncryptedSecret = newCT
+	envelope, err := func() ([]byte, error) {
+		v.mu.RLock()
+		defer v.mu.RUnlock()
+
+		if v.closed {
+			return nil, ErrVaultClosed
 		}
-		pbEntries = append(pbEntries, pe)
-	}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if sameStorage(v.store, dst) {
+			return nil, ErrSameStorage
+		}
 
-	exportVersion := v.version
-	if exportVersion == 0 {
-		exportVersion = 1
-	}
-	now := time.Now().UTC().Unix()
+		exportIndexCipher := v.indexCipher
+		if derivedIndexCipher != nil {
+			exportIndexCipher = derivedIndexCipher
+		}
 
-	plaintext, err := proto.Marshal(&vaultpb.VaultData{
-		Version:   exportVersion,
-		UpdatedAt: now,
-		Entries:   pbEntries,
-	})
+		ids := slices.Sorted(maps.Keys(v.entries))
+		pbEntries := make([]*vaultpb.Entry, 0, len(ids))
+		defer func() {
+			for _, pe := range pbEntries {
+				crypto.ZeroBytes(pe.SecretNonce)
+				crypto.ZeroBytes(pe.EncryptedSecret)
+			}
+		}()
+
+		for _, id := range ids {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			rec := v.entries[id]
+			pe := rec.toProto()
+
+			if exportSecretCipher != nil {
+				aad := entryAAD(rec.id, rec.version)
+				paddedPlain, err := v.secretCipher.Decrypt(rec.secretNonce, rec.encryptedSecret, aad)
+				if err != nil {
+					return nil, fmt.Errorf("%w: %w", ErrSecretCorrupted, err)
+				}
+				unpadded, err := unpadSecret(paddedPlain)
+				if err != nil {
+					crypto.ZeroBytes(paddedPlain)
+					return nil, err
+				}
+				if err := validateSecretPayloadWire(unpadded); err != nil {
+					crypto.ZeroBytes(paddedPlain)
+					return nil, err
+				}
+				newNonce, newCT, err := exportSecretCipher.Encrypt(paddedPlain, aad)
+				crypto.ZeroBytes(paddedPlain)
+				if err != nil {
+					return nil, fmt.Errorf("passwordium: re-encrypt exported secret: %w", err)
+				}
+				crypto.ZeroBytes(pe.SecretNonce)
+				crypto.ZeroBytes(pe.EncryptedSecret)
+				pe.SecretNonce = newNonce
+				pe.EncryptedSecret = newCT
+			}
+			pbEntries = append(pbEntries, pe)
+		}
+
+		exportVersion := v.version
+		if exportVersion == 0 {
+			exportVersion = 1
+		}
+		now := time.Now().UTC().Unix()
+
+		plaintext, err := proto.Marshal(&vaultpb.VaultData{
+			Version:   exportVersion,
+			UpdatedAt: now,
+			Entries:   pbEntries,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("passwordium: marshal exported vault: %w", err)
+		}
+		defer crypto.ZeroBytes(plaintext)
+
+		headerBytes := exportHdr.marshal()
+		nonce, ciphertext, err := exportIndexCipher.Encrypt(plaintext, headerBytes)
+		if err != nil {
+			return nil, fmt.Errorf("passwordium: encrypt exported vault: %w", err)
+		}
+		return packEnvelope(headerBytes, nonce, ciphertext), nil
+	}()
 	if err != nil {
-		return fmt.Errorf("passwordium: marshal exported vault: %w", err)
+		return err
 	}
-	defer crypto.ZeroBytes(plaintext)
-
-	headerBytes := exportHdr.marshal()
-	nonce, ciphertext, err := exportIndexCipher.Encrypt(plaintext, headerBytes)
-	if err != nil {
-		return fmt.Errorf("passwordium: encrypt exported vault: %w", err)
-	}
-	envelope := packEnvelope(headerBytes, nonce, ciphertext)
 
 	if !cfg.overwrite {
 		if es, ok := dst.(exclusiveSaver); ok {
@@ -935,9 +1009,7 @@ func (v *Vault) Import(ctx context.Context, src Storage, srcPassword []byte, opt
 		return ImportResult{}, ErrVaultClosed
 	}
 
-	if same, err := sameStorage(ownStore, src); err != nil {
-		return ImportResult{}, err
-	} else if same {
+	if sameStorage(ownStore, src) {
 		return ImportResult{}, ErrSameStorage
 	}
 
@@ -956,9 +1028,7 @@ func (v *Vault) Import(ctx context.Context, src Storage, srcPassword []byte, opt
 	if err := ctx.Err(); err != nil {
 		return ImportResult{}, err
 	}
-	if same, err := sameStorage(v.store, src); err != nil {
-		return ImportResult{}, err
-	} else if same {
+	if sameStorage(v.store, src) {
 		return ImportResult{}, ErrSameStorage
 	}
 
@@ -1007,6 +1077,7 @@ func (v *Vault) Import(ctx context.Context, src Storage, srcPassword []byte, opt
 		targetID := srcRec.id
 		targetVersion := srcRec.version
 		targetCreatedAt := srcRec.createdAt
+		targetUpdatedAt := srcRec.updatedAt
 		isUpdate := false
 
 		existing, exists := v.entries[targetID]
@@ -1022,13 +1093,26 @@ func (v *Vault) Import(ctx context.Context, src Storage, srcPassword []byte, opt
 					res.Skipped++
 					continue
 				}
+				maxVer := max(existing.version, srcRec.version)
+				if maxVer >= math.MaxUint64-1 {
+					crypto.ZeroBytes(paddedPlain)
+					cleanupStaged()
+					return ImportResult{}, fmt.Errorf("%w: entry %q version overflow", ErrCorruptedVault, targetID)
+				}
 				isUpdate = true
-				targetVersion = max(existing.version, srcRec.version) + 1
+				targetVersion = maxVer + 1
 				targetCreatedAt = existing.createdAt
 			case ConflictOverwrite:
+				maxVer := max(existing.version, srcRec.version)
+				if maxVer >= math.MaxUint64-1 {
+					crypto.ZeroBytes(paddedPlain)
+					cleanupStaged()
+					return ImportResult{}, fmt.Errorf("%w: entry %q version overflow", ErrCorruptedVault, targetID)
+				}
 				isUpdate = true
-				targetVersion = max(existing.version, srcRec.version) + 1
+				targetVersion = maxVer + 1
 				targetCreatedAt = existing.createdAt
+				targetUpdatedAt = max(srcRec.updatedAt, existing.updatedAt)
 			case ConflictKeepBoth:
 				newID, err := generateUUIDv4()
 				if err != nil {
@@ -1056,7 +1140,7 @@ func (v *Vault) Import(ctx context.Context, src Storage, srcPassword []byte, opt
 			url:             srcRec.url,
 			tags:            slices.Clone(srcRec.tags),
 			createdAt:       targetCreatedAt,
-			updatedAt:       srcRec.updatedAt,
+			updatedAt:       targetUpdatedAt,
 			secretNonce:     newNonce,
 			encryptedSecret: newCT,
 		}
@@ -1136,6 +1220,9 @@ func (v *Vault) saveInitialLocked(ctx context.Context, overwrite bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if v.version >= math.MaxUint64-1 {
+		return fmt.Errorf("%w: vault version overflow", ErrCorruptedVault)
+	}
 
 	nextVersion := v.version + 1
 	now := time.Now().UTC().Unix()
@@ -1144,6 +1231,7 @@ func (v *Vault) saveInitialLocked(ctx context.Context, overwrite bool) error {
 	if err != nil {
 		return err
 	}
+	digest := sha256.Sum256(envelope)
 
 	if !overwrite {
 		if es, ok := v.store.(exclusiveSaver); ok {
@@ -1166,7 +1254,7 @@ func (v *Vault) saveInitialLocked(ctx context.Context, overwrite bool) error {
 
 	v.version = nextVersion
 	v.updatedAt = now
-	v.lastDigest = sha256.Sum256(envelope)
+	v.lastDigest = digest
 	v.hasDigest = true
 	v.dirty = false
 	return nil
@@ -1176,6 +1264,9 @@ func (v *Vault) saveLocked(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if v.version >= math.MaxUint64-1 {
+		return fmt.Errorf("%w: vault version overflow", ErrCorruptedVault)
+	}
 
 	nextVersion := v.version + 1
 	now := time.Now().UTC().Unix()
@@ -1184,6 +1275,7 @@ func (v *Vault) saveLocked(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	digest := sha256.Sum256(envelope)
 
 	if v.hasDigest {
 		if cs, ok := v.store.(conditionalSaver); ok {
@@ -1203,7 +1295,7 @@ func (v *Vault) saveLocked(ctx context.Context) error {
 
 	v.version = nextVersion
 	v.updatedAt = now
-	v.lastDigest = sha256.Sum256(envelope)
+	v.lastDigest = digest
 	v.hasDigest = true
 	v.dirty = false
 	return nil
@@ -1282,4 +1374,26 @@ func (v *Vault) Len() int {
 		return 0
 	}
 	return len(v.entries)
+}
+
+// Version returns the current persisted container version of the vault, or 0 if closed.
+// Callers can record Version externally to detect whole-file rollback of the storage backend.
+func (v *Vault) Version() uint64 {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.closed {
+		return 0
+	}
+	return v.version
+}
+
+// UpdatedAt returns the UTC timestamp of the vault's last persisted state (or initial creation),
+// or the zero time.Time if the vault is closed.
+func (v *Vault) UpdatedAt() time.Time {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.closed || v.updatedAt == 0 {
+		return time.Time{}
+	}
+	return time.Unix(v.updatedAt, 0).UTC()
 }

@@ -260,6 +260,14 @@ func TestZeroBytes(t *testing.T) {
 		}
 	}
 	ZeroBytes(nil)
+
+	if _, err := RandomBytes(-1); err == nil {
+		t.Fatal("RandomBytes(-1) must return an error")
+	}
+	empty, err := RandomBytes(0)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("RandomBytes(0) = (%v, %v), want empty slice and nil", empty, err)
+	}
 }
 
 func TestArgon2ParamsValidate(t *testing.T) {
@@ -296,6 +304,7 @@ func TestArgon2ParamsValidateLimits(t *testing.T) {
 
 	limits := DefaultArgon2Limits()
 	rejected := []Argon2Params{
+		{Time: 0, MemoryKiB: 64, Threads: 1},
 		{Time: HardMaxArgonTime, MemoryKiB: HardMaxArgonMemoryKiB, Threads: HardMaxArgonThreads},
 		{Time: DefaultMaxArgonTime + 1, MemoryKiB: 64, Threads: 1},
 		{Time: 1, MemoryKiB: DefaultMaxArgonMemoryKiB + 1, Threads: 1},

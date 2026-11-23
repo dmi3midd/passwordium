@@ -1,0 +1,34 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - gosec
+    - misspell
+    - nilerr
+    - unconvert
+    - unparam
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+        - shadow
+    gosec:
+      excludes:
+        - G304 # FileStorage intentionally opens caller-supplied vault file paths after Lstat/SameFile checks.
+  exclusions:
+    generated: lax
+    paths:
+      - internal/vaultpb
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+          - unparam
+      - path: vault_security_test\.go
+        text: "S1025" # Intentionally tests fmt.Sprintf("%s", sec) redaction.

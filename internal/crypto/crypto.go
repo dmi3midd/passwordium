@@ -177,7 +177,7 @@ func DeriveMasterKey(password, salt []byte, params Argon2Params) ([]byte, error)
 	if err := params.Validate(); err != nil {
 		return nil, err
 	}
-	return argon2.IDKey(password, salt, params.Time, params.MemoryKiB, uint8(params.Threads), KeySize), nil
+	return argon2.IDKey(password, salt, params.Time, params.MemoryKiB, uint8(params.Threads), KeySize), nil // #nosec G115 -- params.Validate enforces Threads <= 255
 }
 
 // DeriveSubKey derives a domain-separated 32-byte subkey from masterKey using HKDF-SHA256.
@@ -234,7 +234,7 @@ func (c *Cipher) Encrypt(plaintext, associatedData []byte) (nonce, ciphertext []
 		return nil, nil, err
 	}
 
-	ciphertext = c.aead.Seal(nil, nonce, plaintext, associatedData)
+	ciphertext = c.aead.Seal(nil, nonce, plaintext, associatedData) // #nosec G407 -- nonce is freshly generated via crypto/rand in RandomBytes
 	return nonce, ciphertext, nil
 }
 
